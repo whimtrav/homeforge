@@ -3,8 +3,11 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
 	"log/slog"
+	"mime"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +17,16 @@ import (
 	"github.com/whimtrav/homeforge/internal/config"
 	"github.com/whimtrav/homeforge/internal/entity"
 )
+
+func init() {
+	// Alpine Linux has no /etc/mime.types — register essentials explicitly.
+	mime.AddExtensionType(".js", "application/javascript")
+	mime.AddExtensionType(".mjs", "application/javascript")
+	mime.AddExtensionType(".css", "text/css; charset=utf-8")
+	mime.AddExtensionType(".svg", "image/svg+xml")
+	mime.AddExtensionType(".json", "application/json")
+	mime.AddExtensionType(".woff2", "font/woff2")
+}
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
@@ -63,8 +76,8 @@ func (s *Server) Run(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// Serve embedded frontend.
-	mux.Handle("/", http.FileServer(http.FS(webFS())))
+	// Serve embedded frontend with SPA fallback.
+	mux.Handle("/", spaHandler(webFS()))
 
 	addr := s.cfg.Addr
 	if addr == "" {
@@ -163,4 +176,25 @@ func (s *Server) broadcast(msg []byte) {
 	for conn := range s.clients {
 		conn.WriteMessage(websocket.TextMessage, msg)
 	}
+}
+
+// spaHandler serves static files and falls back to index.html for unknown paths
+// so SvelteKit client-side routing works correctly.
+func spaHandler(fsys fs.FS) http.Handler {
+	fileServer := http.FileServer(http.FS(fsys))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path == "" {
+			path = "index.html"
+		}
+		_, err := fs.Stat(fsys, path)
+		if err != nil {
+			// File not found — serve index.html for SPA routing.
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/"
+			fileServer.ServeHTTP(w, r2)
+			return
+		}
+		fileServer.ServeHTTP(w, r)
+	})
 }

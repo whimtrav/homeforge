@@ -5,7 +5,7 @@ import (
 	"io/fs"
 )
 
-//go:embed webdist
+//go:embed all:webdist
 var embeddedWeb embed.FS
 
 func webFS() fs.FS {
