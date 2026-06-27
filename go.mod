@@ -3,6 +3,7 @@ module github.com/whimtrav/homeforge
 go 1.23
 
 require (
+	github.com/eclipse/paho.mqtt.golang v1.5.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/mochi-mqtt/server/v2 v2.6.6

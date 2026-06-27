@@ -7,10 +7,11 @@ RUN npm run build
 
 FROM golang:1.23-alpine AS builder
 WORKDIR /build
-COPY go.mod go.sum ./
-RUN go mod download
+COPY go.mod ./
+RUN go mod download || true
 COPY . .
-COPY --from=web-builder /web/build ./internal/api/webdist
+RUN go mod tidy
+COPY --from=web-builder /internal/api/webdist ./internal/api/webdist
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o homeforge ./cmd/homeforge
 
 FROM alpine:3.20
