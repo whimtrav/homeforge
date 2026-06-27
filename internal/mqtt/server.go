@@ -102,10 +102,16 @@ func (s *Server) Run(ctx context.Context) {
 func (s *Server) onConnect(c mqttclient.Client) {
 	slog.Info("mqtt: client connected")
 
-	// Subscribe to all Zigbee2MQTT device state topics.
-	c.Subscribe("zigbee2mqtt/+", 0, s.handleZigbee2MQTT)
+	// HA MQTT discovery messages are retained — seed entities from them
+	// immediately on connect. Device state updates arrive on zigbee2mqtt/+.
+	c.Subscribe("homeassistant/#", 0, s.handleHADiscovery)
 
-	// Subscribe to Tasmota stat topics.
+	// Zigbee2MQTT live device state updates.
+	c.Subscribe("zigbee2mqtt/+", 0, s.handleZigbee2MQTT)
+	// Multi-level topics (e.g. groups, scenes).
+	c.Subscribe("zigbee2mqtt/+/+", 0, s.handleZigbee2MQTT)
+
+	// Tasmota stat topics.
 	c.Subscribe("stat/+/RESULT", 0, s.handleTasmota)
 	c.Subscribe("stat/+/POWER", 0, s.handleTasmota)
 	c.Subscribe("tele/+/SENSOR", 0, s.handleTasmota)
@@ -114,12 +120,82 @@ func (s *Server) onConnect(c mqttclient.Client) {
 	// Sentinel NVR detection events.
 	c.Subscribe("sentinel/+/detection/+", 0, s.handleSentinel)
 
-	// Publish all messages to internal bus for automation engine.
+	// Forward all messages to automation engine.
 	c.Subscribe("#", 0, func(_ mqttclient.Client, msg mqttclient.Message) {
 		s.bus.Publish(TopicMQTTMessage, Message{
 			Topic:   msg.Topic(),
 			Payload: msg.Payload(),
 		})
+	})
+
+	// Request Z2M to re-publish all device states.
+	c.Publish("zigbee2mqtt/bridge/request/devices", 0, false, "{}")
+}
+
+// handleHADiscovery parses retained HA MQTT discovery config messages to seed
+// entities before any live state arrives. Topic format:
+// homeassistant/{domain}/{node_id}/{object_id}/config
+func (s *Server) handleHADiscovery(_ mqttclient.Client, msg mqttclient.Message) {
+	parts := strings.Split(msg.Topic(), "/")
+	if len(parts) < 4 || parts[len(parts)-1] != "config" {
+		return
+	}
+	domain := parts[1]
+	switch domain {
+	case "sensor", "binary_sensor", "light", "switch", "lock", "climate", "cover":
+	default:
+		return
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal(msg.Payload(), &cfg); err != nil {
+		return
+	}
+
+	name, _ := cfg["name"].(string)
+	if name == "" {
+		return
+	}
+
+	// Extract device friendly name from state_topic: "zigbee2mqtt/FriendlyName"
+	stateTopic, _ := cfg["state_topic"].(string)
+	friendlyName := ""
+	if stateTopic != "" {
+		tp := strings.Split(stateTopic, "/")
+		if len(tp) >= 2 {
+			friendlyName = tp[len(tp)-1]
+		}
+	}
+	if friendlyName == "" || friendlyName == "bridge" {
+		return
+	}
+
+	// Build a human-readable entity ID from device name + attribute name.
+	// e.g. light.hallway or sensor.hallway_temperature
+	attrName := sanitizeID(name)
+	deviceID := sanitizeID(friendlyName)
+
+	var id string
+	if attrName == deviceID || attrName == "" {
+		id = domain + "." + deviceID
+	} else {
+		id = domain + "." + deviceID + "_" + attrName
+	}
+
+	// Don't overwrite an entity that already has real state.
+	if existing, exists := s.store.Get(id); exists && existing.State != "unknown" {
+		return
+	}
+
+	s.store.Set(entity.Entity{
+		ID:     id,
+		Name:   friendlyName + " " + name,
+		Domain: domain,
+		State:  "unknown",
+		Attributes: map[string]any{
+			"friendly_name": friendlyName,
+			"state_topic":   stateTopic,
+		},
 	})
 }
 
@@ -128,10 +204,17 @@ func (s *Server) handleZigbee2MQTT(_ mqttclient.Client, msg mqttclient.Message) 
 	if len(parts) < 2 {
 		return
 	}
+	// Skip bridge control/response topics.
+	if parts[1] == "bridge" {
+		return
+	}
 	deviceName := parts[1]
 
 	var payload map[string]any
 	if err := json.Unmarshal(msg.Payload(), &payload); err != nil {
+		return
+	}
+	if len(payload) == 0 {
 		return
 	}
 
