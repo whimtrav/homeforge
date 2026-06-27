@@ -1,0 +1,15 @@
+services:
+  homeforge:
+    image: homeforge
+    build: .
+    container_name: homeforge
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config.yaml:/etc/homeforge/config.yaml:ro
+      - homeforge_data:/data
+    environment:
+      - TZ=America/Denver
+
+volumes:
+  homeforge_data:
