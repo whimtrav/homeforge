@@ -1,0 +1,72 @@
+api:
+  addr: ":8123"
+
+database:
+  driver: sqlite       # or "postgres"
+  dsn: homeforge.db   # for postgres: "postgres://user:pass@localhost/homeforge"
+
+mqtt:
+  external: false      # true = connect to existing broker
+  host: localhost      # only used when external: true
+  port: 1883
+  # username: ""
+  # password: ""
+
+integrations:
+  zigbee2mqtt:
+    enabled: true
+    base_topic: zigbee2mqtt
+
+  esphome:
+    enabled: true
+    devices:
+      - name: main_bedroom_closet_light
+        host: 10.20.20.65
+        port: 6053
+
+  wiz:
+    enabled: true
+    bulbs:
+      - name: wiz_front_yard
+        ip: 10.20.20.159
+      - name: wiz_backyard
+        ip: 10.20.20.167
+
+  wled:
+    enabled: true
+    devices:
+      - name: wled_garage
+        host: 10.66.66.195
+      - name: wled_porch
+        host: 10.66.66.46
+
+  emporia:
+    enabled: true
+    email: your@email.com
+    password: yourpassword
+
+  tigo:
+    enabled: true
+    host: 10.66.66.25
+
+automations:
+  - name: Hallway Motion Light
+    trigger:
+      type: state_change
+      entity: binary_sensor.hallway_motion
+      to: "on"
+    action:
+      - service: light.turn_on
+        entity: light.hallway
+      - wait: 300s
+      - service: light.turn_off
+        entity: light.hallway
+
+  - name: Front Porch Sunrise Off
+    trigger:
+      type: state_change
+      entity: sensor.sun_elevation
+      to: "above_horizon"
+    action:
+      - service: light.turn_off
+        entity: light.front_porch

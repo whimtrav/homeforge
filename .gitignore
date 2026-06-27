@@ -1,0 +1,20 @@
+# Go
+homeforge
+*.exe
+
+# Data
+*.db
+*.db-shm
+*.db-wal
+config.yaml
+
+# Frontend build output
+internal/api/webdist/*
+!internal/api/webdist/.gitkeep
+web/.svelte-kit/
+web/build/
+web/node_modules/
+
+# Misc
+.env
+*.log
