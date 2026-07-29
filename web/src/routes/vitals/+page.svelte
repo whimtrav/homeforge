@@ -6,9 +6,11 @@
   let cache = $state<Record<string, Entity>>({})
   let disconnect: (() => void) | null = null
   let now = $state(Date.now())
+  let base = $state('') // this HomeForge's own origin, for the setup-URL help
 
   const absorb = (e: Entity) => { if (e.id.startsWith('sensor.health_')) cache[e.id] = e }
   onMount(async () => {
+    base = location.origin
     for (const e of await fetchEntities()) absorb(e)
     disconnect = connectWS((msg) => {
       if (msg.type === 'snapshot' && msg.entities) { for (const e of msg.entities) absorb(e) }
@@ -159,9 +161,9 @@
     <div class="px-4 pb-4" style="color: var(--text-muted)">
       <p class="mb-2">Each person pushes from their own phone (Health Connect → HC Webhook app). Set the webhook URL to:</p>
       <p class="mb-1"><strong>Bo</strong> (default, drawn as a man):</p>
-      <pre class="p-3 rounded text-xs mb-2" style="background: var(--surface-2); overflow-x: auto; color: var(--text)">http://192.168.1.10:8093/api/health</pre>
+      <pre class="p-3 rounded text-xs mb-2" style="background: var(--surface-2); overflow-x: auto; color: var(--text)">{base}/api/health</pre>
       <p class="mb-1"><strong>Anyone else</strong> — add <code>?person=Name&figure=woman</code> (figure = man / woman / child):</p>
-      <pre class="p-3 rounded text-xs" style="background: var(--surface-2); overflow-x: auto; color: var(--text)">http://192.168.1.10:8093/api/health?person=Name&figure=woman</pre>
+      <pre class="p-3 rounded text-xs" style="background: var(--surface-2); overflow-x: auto; color: var(--text)">{base}/api/health?person=Name&figure=woman</pre>
     </div>
   </details>
 </div>

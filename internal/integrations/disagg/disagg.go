@@ -100,7 +100,8 @@ func (m *Manager) Run(ctx context.Context) {
 	}
 	host := m.cfg.MeterHost
 	if host == "" {
-		host = "192.168.1.10"
+		slog.Warn("disagg: no meter_host configured — set integrations.disagg.meter_host; skipping")
+		return
 	}
 	slog.Info("disagg: starting", "meter_host", host)
 	t := time.NewTicker(pollEvery)

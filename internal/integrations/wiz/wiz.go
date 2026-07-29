@@ -37,8 +37,31 @@ const (
 	discoverWait  = 1500 * time.Millisecond
 )
 
-// Directed-broadcast targets — one per homeforge subnet.
-var bcastAddrs = []string{"192.168.1.10", "192.168.1.20"}
+// wizBroadcasts returns a directed-broadcast address for each local IPv4 subnet, so WiZ
+// discovery works on any network with no hardcoded IPs (plus the global broadcast as fallback).
+func wizBroadcasts() []string {
+	var out []string
+	ifaces, _ := net.Interfaces()
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := ifc.Addrs()
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok || ipnet.IP.To4() == nil {
+				continue
+			}
+			ip, mask := ipnet.IP.To4(), ipnet.Mask
+			bc := make(net.IP, 4)
+			for i := 0; i < 4; i++ {
+				bc[i] = ip[i] | ^mask[i]
+			}
+			out = append(out, bc.String())
+		}
+	}
+	return append(out, "255.255.255.255")
+}
 
 // bulb is the cached view of one physical WiZ light.
 type bulb struct {
@@ -161,7 +184,7 @@ func (m *Manager) discover() {
 		})
 	}
 
-	for _, addr := range bcastAddrs {
+	for _, addr := range wizBroadcasts() {
 		_, _ = pc.WriteToUDP(req, &net.UDPAddr{IP: net.ParseIP(addr), Port: wizPort})
 	}
 

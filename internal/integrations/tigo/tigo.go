@@ -48,7 +48,8 @@ func (m *Manager) Run(ctx context.Context) {
 	}
 	host := m.cfg.Host
 	if host == "" {
-		host = "192.168.1.10"
+		slog.Warn("tigo: no host configured — set integrations.tigo.host; skipping")
+		return
 	}
 	slog.Info("tigo: starting", "host", host)
 	m.poll(host)
