@@ -16,14 +16,23 @@ type Config struct {
 	Integrations IntegrationsConfig `yaml:"integrations"`
 	Assistant    AssistantConfig    `yaml:"assistant"`
 	Auth         AuthConfig         `yaml:"auth"`
+	Cameras      CamerasConfig      `yaml:"cameras"`
+}
+
+// CamerasConfig lets HomeForge reverse-proxy an NVR (e.g. Sentinel/Frigate) so it's reachable
+// over the same tunnel + login. When nvr_host is set, requests to that Host are auth-gated and
+// proxied to nvr_upstream. Leave nvr_host blank to just embed the NVR directly on the LAN.
+type CamerasConfig struct {
+	NvrUpstream string `yaml:"nvr_upstream"` // NVR (Sentinel/Frigate) base URL; HomeForge serves it under /nvr/. Default http://localhost:5000
 }
 
 // AuthConfig — HomeForge's own login (protects the tunnel, VPN, and LAN alike).
 type AuthConfig struct {
-	Enabled     bool   `yaml:"enabled"`
-	OwnerEmail  string `yaml:"owner_email"`  // pre-filled on first-run setup
-	UsersFile   string `yaml:"users_file"`   // JSON store of accounts
-	SessionDays int    `yaml:"session_days"` // cookie lifetime
+	Enabled      bool   `yaml:"enabled"`
+	OwnerEmail   string `yaml:"owner_email"`   // pre-filled on first-run setup
+	UsersFile    string `yaml:"users_file"`    // JSON store of accounts
+	SessionDays  int    `yaml:"session_days"`  // cookie lifetime
+	CookieDomain string `yaml:"cookie_domain"` // e.g. ".example.com" to share the session across subdomains (blank = host-only)
 }
 
 // AssistantConfig configures the local-LLM chat assistant. Defaults are tuned for a
@@ -405,6 +414,11 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Auth.SessionDays == 0 {
 		cfg.Auth.SessionDays = 30
+	}
+
+	// Cameras defaults
+	if cfg.Cameras.NvrUpstream == "" {
+		cfg.Cameras.NvrUpstream = "http://localhost:5000"
 	}
 
 	return cfg, nil

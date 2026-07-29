@@ -61,6 +61,12 @@ auth:
   enabled: true
   owner_email: you@example.com   # pre-filled on first-run account setup
   session_days: 30
+  # cookie_domain: ".example.com"   # only needed to share the session across subdomains
+
+# ── Cameras (optional): embed an NVR (Sentinel/Frigate) under /nvr/ on this same domain,
+#    behind the login. HomeForge reverse-proxies + path-rewrites it so it works over a tunnel. ──
+cameras:
+  nvr_upstream: http://localhost:5000
 
 automations:
   - name: Hallway Motion Light

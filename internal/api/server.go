@@ -9,6 +9,8 @@ import (
 	"math"
 	"mime"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -42,6 +44,8 @@ var upgrader = websocket.Upgrader{
 type Server struct {
 	cfg           config.APIConfig
 	assistantCfg  config.AssistantConfig
+	camerasCfg    config.CamerasConfig
+	nvrProxy      *httputil.ReverseProxy
 	mem           *assistantMemory
 	auth          *authStore
 	internalToken string
@@ -372,7 +376,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: s.authMiddleware(mux),
+		Handler: s.nvrRouter(s.authMiddleware(mux)),
 	}
 
 	slog.Info("api: listening", "addr", addr)
@@ -886,6 +890,75 @@ func (s *Server) handleEntity(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(e)
+}
+
+// SetCameras configures the optional NVR reverse-proxy. HomeForge serves the NVR (e.g.
+// Sentinel/Frigate) under /nvr/ on its OWN domain (one domain, one login), rewriting the NVR's
+// absolute asset/API paths to the /nvr/ prefix so the whole embedded UI works behind the tunnel.
+func (s *Server) SetCameras(c config.CamerasConfig) {
+	s.camerasCfg = c
+	if c.NvrUpstream == "" {
+		return
+	}
+	u, err := url.Parse(c.NvrUpstream)
+	if err != nil {
+		return
+	}
+	s.nvrProxy = &httputil.ReverseProxy{
+		Director: func(r *http.Request) {
+			r.URL.Scheme, r.URL.Host, r.Host = u.Scheme, u.Host, u.Host
+			r.URL.Path = strings.TrimPrefix(r.URL.Path, "/nvr")
+			if r.URL.Path == "" {
+				r.URL.Path = "/"
+			}
+			r.Header.Del("Accept-Encoding") // need uncompressed bodies to rewrite paths
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			ct := resp.Header.Get("Content-Type")
+			if !strings.Contains(ct, "html") && !strings.Contains(ct, "javascript") && !strings.Contains(ct, "css") {
+				return nil // pass images/video/json straight through
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return err
+			}
+			out := string(body)
+			for _, pfx := range []string{"/assets/", "/api/", "/favicon", "/vod/", "/clips/"} {
+				out = strings.ReplaceAll(out, `"`+pfx, `"/nvr`+pfx)
+				out = strings.ReplaceAll(out, `'`+pfx, `'/nvr`+pfx)
+			}
+			resp.Body = io.NopCloser(strings.NewReader(out))
+			resp.ContentLength = int64(len(out))
+			resp.Header.Set("Content-Length", strconv.Itoa(len(out)))
+			return nil
+		},
+	}
+}
+
+// nvrRouter serves the NVR under /nvr/ (auth-gated), else falls through to normal HomeForge.
+func (s *Server) nvrRouter(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.nvrProxy != nil && (r.URL.Path == "/nvr" || strings.HasPrefix(r.URL.Path, "/nvr/")) {
+			if r.URL.Path == "/nvr" { // trailing slash so the NVR's relative assets resolve under /nvr/
+				http.Redirect(w, r, "/nvr/", http.StatusMovedPermanently)
+				return
+			}
+			if s.auth != nil && s.auth.enabled {
+				ok := false
+				if c, err := r.Cookie(sessionCookie); err == nil {
+					_, ok = s.auth.valid(c.Value)
+				}
+				if !ok {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+			}
+			s.nvrProxy.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleServiceCall(w http.ResponseWriter, r *http.Request) {

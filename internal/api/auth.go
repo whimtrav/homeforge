@@ -35,11 +35,12 @@ type authSession struct {
 
 type authStore struct {
 	mu          sync.Mutex
-	enabled     bool
-	ownerEmail  string
-	usersPath   string
-	sessPath    string
-	sessionDays int
+	enabled      bool
+	ownerEmail   string
+	usersPath    string
+	sessPath     string
+	sessionDays  int
+	cookieDomain string
 	users       map[string]authUser
 	sessions    map[string]authSession
 	fails       map[string]int   // client ip -> recent failed logins
@@ -48,11 +49,12 @@ type authStore struct {
 
 func newAuthStore(c config.AuthConfig) *authStore {
 	a := &authStore{
-		enabled:     c.Enabled,
-		ownerEmail:  strings.ToLower(strings.TrimSpace(c.OwnerEmail)),
-		usersPath:   c.UsersFile,
-		sessPath:    strings.TrimSuffix(c.UsersFile, ".json") + "-sessions.json",
-		sessionDays: c.SessionDays,
+		enabled:      c.Enabled,
+		ownerEmail:   strings.ToLower(strings.TrimSpace(c.OwnerEmail)),
+		usersPath:    c.UsersFile,
+		sessPath:     strings.TrimSuffix(c.UsersFile, ".json") + "-sessions.json",
+		sessionDays:  c.SessionDays,
+		cookieDomain: strings.TrimSpace(c.CookieDomain),
 		users:       map[string]authUser{},
 		sessions:    map[string]authSession{},
 		fails:       map[string]int{},
@@ -320,6 +322,7 @@ func (s *Server) setSession(w http.ResponseWriter, r *http.Request, email string
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: tok, Path: "/", HttpOnly: true,
 		SameSite: http.SameSiteLaxMode, Secure: secureCookie(r),
+		Domain:  s.auth.cookieDomain, // blank = host-only; ".example.com" shares across subdomains (NVR proxy)
 		Expires: time.Now().AddDate(0, 0, s.auth.sessionDays),
 	})
 }
