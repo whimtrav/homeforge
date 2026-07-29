@@ -15,6 +15,7 @@
     ['/automations', 'Automations'],
     ['/energy', 'Energy'],
     ['/cameras', 'Cameras'],
+    ['/events', 'Events'],
     ['/zigbee', 'Zigbee'],
     ['/ring', 'Ring'],
     ['/vitals', 'Health'],

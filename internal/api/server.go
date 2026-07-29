@@ -356,6 +356,9 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/assistant/tts", s.handleTTS)
 	mux.HandleFunc("GET /api/cameras", s.handleCamerasList)
 	mux.HandleFunc("GET /api/cameras/{name}/frame", s.handleCameraFrame)
+	mux.HandleFunc("GET /api/events", s.handleEventsList)
+	mux.HandleFunc("GET /api/events/{id}/snapshot", s.handleEventSnapshot)
+	mux.HandleFunc("GET /api/events/{id}/clip", s.handleEventClip)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -964,43 +967,55 @@ func (s *Server) nvrRouter(next http.Handler) http.Handler {
 	})
 }
 
-// handleCamerasList proxies the NVR's camera list (name + online) for the native grid.
-func (s *Server) handleCamerasList(w http.ResponseWriter, r *http.Request) {
+// proxyToNVR forwards a GET to the NVR at upstreamPath (server-side, behind HomeForge's login),
+// preserving the query string and forwarding/returning Range so video clips can seek.
+func (s *Server) proxyToNVR(w http.ResponseWriter, r *http.Request, upstreamPath string) {
 	if s.camerasCfg.NvrUpstream == "" {
-		writeJSON(w, []any{})
+		http.Error(w, "no nvr configured", http.StatusServiceUnavailable)
 		return
 	}
-	resp, err := (&http.Client{Timeout: 8 * time.Second}).Get(s.camerasCfg.NvrUpstream + "/api/cameras")
+	target := s.camerasCfg.NvrUpstream + upstreamPath
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if rg := r.Header.Get("Range"); rg != "" {
+		req.Header.Set("Range", rg)
+	}
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
 		http.Error(w, "nvr unavailable", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
+	for _, h := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control", "Last-Modified", "Etag"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
 
-// handleCameraFrame proxies one camera's latest JPEG frame (the native grid polls this ~1/s).
+// Camera + event endpoints — native views, all behind HomeForge's login.
+func (s *Server) handleCamerasList(w http.ResponseWriter, r *http.Request) {
+	s.proxyToNVR(w, r, "/api/cameras")
+}
 func (s *Server) handleCameraFrame(w http.ResponseWriter, r *http.Request) {
-	if s.camerasCfg.NvrUpstream == "" {
-		http.Error(w, "no nvr", http.StatusServiceUnavailable)
-		return
-	}
-	name := r.PathValue("name")
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(
-		s.camerasCfg.NvrUpstream + "/api/cameras/" + url.PathEscape(name) + "/latest-frame")
-	if err != nil {
-		http.Error(w, "nvr unavailable", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		http.Error(w, "no frame", resp.StatusCode)
-		return
-	}
-	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Cache-Control", "no-store")
-	io.Copy(w, resp.Body)
+	s.proxyToNVR(w, r, "/api/cameras/"+url.PathEscape(r.PathValue("name"))+"/latest-frame")
+}
+func (s *Server) handleEventsList(w http.ResponseWriter, r *http.Request) {
+	s.proxyToNVR(w, r, "/api/events")
+}
+func (s *Server) handleEventSnapshot(w http.ResponseWriter, r *http.Request) {
+	s.proxyToNVR(w, r, "/api/events/"+url.PathEscape(r.PathValue("id"))+"/snapshot.jpg")
+}
+func (s *Server) handleEventClip(w http.ResponseWriter, r *http.Request) {
+	s.proxyToNVR(w, r, "/api/events/"+url.PathEscape(r.PathValue("id"))+"/clip.mp4")
 }
 
 func (s *Server) handleServiceCall(w http.ResponseWriter, r *http.Request) {
