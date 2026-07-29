@@ -927,6 +927,7 @@ func (s *Server) SetCameras(c config.CamerasConfig) {
 			for _, pfx := range []string{"/assets/", "/api/", "/favicon", "/vod/", "/clips/"} {
 				out = strings.ReplaceAll(out, `"`+pfx, `"/nvr`+pfx)
 				out = strings.ReplaceAll(out, `'`+pfx, `'/nvr`+pfx)
+				out = strings.ReplaceAll(out, "`"+pfx, "`/nvr"+pfx) // template-literal URLs (live frames, recordings, clips)
 			}
 			resp.Body = io.NopCloser(strings.NewReader(out))
 			resp.ContentLength = int64(len(out))
