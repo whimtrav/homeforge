@@ -354,6 +354,8 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/assistant", s.handleAssistant)
 	mux.HandleFunc("POST /api/assistant/stt", s.handleSTT)
 	mux.HandleFunc("POST /api/assistant/tts", s.handleTTS)
+	mux.HandleFunc("GET /api/cameras", s.handleCamerasList)
+	mux.HandleFunc("GET /api/cameras/{name}/frame", s.handleCameraFrame)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -960,6 +962,45 @@ func (s *Server) nvrRouter(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// handleCamerasList proxies the NVR's camera list (name + online) for the native grid.
+func (s *Server) handleCamerasList(w http.ResponseWriter, r *http.Request) {
+	if s.camerasCfg.NvrUpstream == "" {
+		writeJSON(w, []any{})
+		return
+	}
+	resp, err := (&http.Client{Timeout: 8 * time.Second}).Get(s.camerasCfg.NvrUpstream + "/api/cameras")
+	if err != nil {
+		http.Error(w, "nvr unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	io.Copy(w, resp.Body)
+}
+
+// handleCameraFrame proxies one camera's latest JPEG frame (the native grid polls this ~1/s).
+func (s *Server) handleCameraFrame(w http.ResponseWriter, r *http.Request) {
+	if s.camerasCfg.NvrUpstream == "" {
+		http.Error(w, "no nvr", http.StatusServiceUnavailable)
+		return
+	}
+	name := r.PathValue("name")
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(
+		s.camerasCfg.NvrUpstream + "/api/cameras/" + url.PathEscape(name) + "/latest-frame")
+	if err != nil {
+		http.Error(w, "nvr unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, "no frame", resp.StatusCode)
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "no-store")
+	io.Copy(w, resp.Body)
 }
 
 func (s *Server) handleServiceCall(w http.ResponseWriter, r *http.Request) {
