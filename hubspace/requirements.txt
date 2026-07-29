@@ -1,0 +1,4 @@
+aioafero==7.0.4
+aiofiles
+packaging
+paho-mqtt==1.6.1

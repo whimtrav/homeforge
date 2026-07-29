@@ -1,16 +1,24 @@
+# HomeForge example config. Copy to `config.yaml` (gitignored) and edit for your home.
+# IPs below are placeholders — replace with your own devices.
+
 api:
-  addr: ":8123"
+  addr: ":8093"
 
 database:
-  driver: sqlite       # or "postgres"
-  dsn: homeforge.db   # for postgres: "postgres://user:pass@localhost/homeforge"
+  driver: sqlite            # or "postgres"
+  dsn: homeforge.db         # postgres: "postgres://user:pass@localhost/homeforge"
 
 mqtt:
-  external: false      # true = connect to existing broker
-  host: localhost      # only used when external: true
+  external: false           # true = use an existing broker instead of the embedded one
+  host: localhost
   port: 1883
   # username: ""
   # password: ""
+
+history:
+  enabled: true             # long-term history in TimescaleDB (see docker-compose.yml)
+  dsn: "postgres://homeforge:${POSTGRES_PASSWORD}@127.0.0.1:5433/homeforge"
+  retention_raw: "30 days"
 
 integrations:
   zigbee2mqtt:
@@ -18,36 +26,41 @@ integrations:
     base_topic: zigbee2mqtt
 
   esphome:
-    enabled: true
+    enabled: false
     devices:
-      - name: main_bedroom_closet_light
-        host: 192.168.1.20
+      - name: bedroom_light
+        host: 192.168.1.50
         port: 6053
 
   wiz:
-    enabled: true
+    enabled: false
     bulbs:
-      - name: wiz_front_yard
-        ip: 192.168.1.20
-      - name: wiz_backyard
-        ip: 192.168.1.20
+      - name: living_room
+        ip: 192.168.1.60
 
   wled:
-    enabled: true
+    enabled: false
     devices:
-      - name: wled_garage
-        host: 192.168.1.10
-      - name: wled_porch
-        host: 192.168.1.10
+      - name: garage_strip
+        host: 192.168.1.70
 
-  emporia:
-    enabled: true
-    email: your@email.com
-    password: yourpassword
+# ── Local AI assistant (optional; needs an ollama server — see README) ──
+assistant:
+  enabled: false
+  model: qwen2.5:3b-instruct
+  ollama_url: http://127.0.0.1:11435/api/chat
+  num_ctx: 4096
+  num_thread: 4
+  num_gpu: 0                # 0 = CPU-only
+  prewarm: true
+  # whisper_url: http://127.0.0.1:9010   # speech-to-text (optional)
+  # piper_url:   http://127.0.0.1:5111   # text-to-speech (optional)
 
-  tigo:
-    enabled: true
-    host: 192.168.1.10
+# ── Login (strongly recommended if you expose HomeForge beyond your LAN) ──
+auth:
+  enabled: true
+  owner_email: you@example.com   # pre-filled on first-run account setup
+  session_days: 30
 
 automations:
   - name: Hallway Motion Light
@@ -61,12 +74,3 @@ automations:
       - wait: 300s
       - service: light.turn_off
         entity: light.hallway
-
-  - name: Front Porch Sunrise Off
-    trigger:
-      type: state_change
-      entity: sensor.sun_elevation
-      to: "above_horizon"
-    action:
-      - service: light.turn_off
-        entity: light.front_porch

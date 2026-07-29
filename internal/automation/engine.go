@@ -3,6 +3,7 @@ package automation
 import (
 	"context"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/whimtrav/homeforge/internal/bus"
@@ -14,34 +15,33 @@ type Engine struct {
 	automations []config.AutomationConfig
 	store       *entity.Store
 	bus         *bus.Bus
+	state       *StateStore // per-automation enabled/disabled overrides (nil = all enabled)
 }
 
-func NewEngine(automations []config.AutomationConfig, store *entity.Store, b *bus.Bus) *Engine {
+func NewEngine(automations []config.AutomationConfig, store *entity.Store, b *bus.Bus, state *StateStore) *Engine {
 	return &Engine{
 		automations: automations,
 		store:       store,
 		bus:         b,
+		state:       state,
 	}
 }
 
 func (e *Engine) Run(ctx context.Context) {
-	// Subscribe to state changes to evaluate state_change triggers.
+	// Subscribe to state changes to evaluate state_change and numeric triggers.
 	e.bus.Subscribe(entity.TopicStateChanged, func(ev bus.Event) {
 		payload, ok := ev.Payload.(entity.StateChangedPayload)
 		if !ok {
 			return
 		}
 		for _, a := range e.automations {
-			if a.Trigger.Type != "state_change" {
-				continue
-			}
 			if a.Trigger.Entity != payload.Entity.ID {
 				continue
 			}
-			if a.Trigger.To != "" && a.Trigger.To != payload.Entity.State {
+			if !e.state.Enabled(a.Name) { // user-disabled via the UI
 				continue
 			}
-			if a.Trigger.From != "" && a.Trigger.From != payload.OldState {
+			if !triggerFires(a.Trigger, payload) {
 				continue
 			}
 			if !e.checkCondition(a.Condition) {
@@ -55,6 +55,38 @@ func (e *Engine) Run(ctx context.Context) {
 	<-ctx.Done()
 }
 
+// triggerFires decides whether an incoming state change matches a trigger.
+//   - state_change: optional to/from string match (empty = any).
+//   - numeric: crosses a threshold. `above` fires on the sample where the value
+//     goes from <=X to >X; `below` fires on >=X to <X. Requires a valid prior
+//     value so it fires only on the transition, never repeatedly while past it.
+func triggerFires(t config.TriggerConfig, p entity.StateChangedPayload) bool {
+	switch t.Type {
+	case "state_change":
+		if t.To != "" && t.To != p.Entity.State {
+			return false
+		}
+		if t.From != "" && t.From != p.OldState {
+			return false
+		}
+		return true
+	case "numeric":
+		newV, err1 := strconv.ParseFloat(p.Entity.State, 64)
+		oldV, err2 := strconv.ParseFloat(p.OldState, 64)
+		if err1 != nil || err2 != nil {
+			return false // need both values to detect a crossing
+		}
+		if t.Above != nil {
+			return oldV <= *t.Above && newV > *t.Above
+		}
+		if t.Below != nil {
+			return oldV >= *t.Below && newV < *t.Below
+		}
+		return false
+	}
+	return false
+}
+
 func (e *Engine) checkCondition(c *config.ConditionConfig) bool {
 	if c == nil {
 		return true
@@ -66,6 +98,39 @@ func (e *Engine) checkCondition(c *config.ConditionConfig) bool {
 			return false
 		}
 		return ent.State == c.State
+	case "numeric":
+		ent, ok := e.store.Get(c.Entity)
+		if !ok {
+			return false
+		}
+		v, err := strconv.ParseFloat(ent.State, 64)
+		if err != nil {
+			return false
+		}
+		if c.Above != nil && v <= *c.Above {
+			return false
+		}
+		if c.Below != nil && v >= *c.Below {
+			return false
+		}
+		return true
+	case "and":
+		for _, sub := range c.Conditions {
+			if !e.checkCondition(sub) {
+				return false
+			}
+		}
+		return true
+	case "or":
+		if len(c.Conditions) == 0 {
+			return true
+		}
+		for _, sub := range c.Conditions {
+			if e.checkCondition(sub) {
+				return true
+			}
+		}
+		return false
 	case "time_range":
 		now := time.Now().Format("15:04")
 		return now >= c.After && now <= c.Before
@@ -87,6 +152,10 @@ func (e *Engine) runActions(ctx context.Context, actions []config.ActionConfig) 
 				select {
 				case <-time.After(d):
 				case <-ctx.Done():
+					return
+				}
+				if action.Condition != nil && !e.checkCondition(action.Condition) {
+					slog.Info("automation: sequence aborted (post-wait condition false)")
 					return
 				}
 				continue

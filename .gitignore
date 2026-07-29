@@ -1,20 +1,36 @@
-# Go
-homeforge
-*.exe
+# ── Secrets & local config — NEVER commit ──
+.env
+**/.env
+config.yaml
+config.yaml.*
+*.key
+*.pem
+*.p12
+*secret*
+*credential*
 
-# Data
+# ── Backups / scratch ──
+*bak*
+*.bak
+*.pre-*
+*.orig
+*.tmp
+*.tgz
+
+# ── Data / runtime ──
+/data
+data/
 *.db
 *.db-shm
 *.db-wal
-config.yaml
+*.log
 
-# Frontend build output
+# ── Build output ──
+homeforge
+*.exe
 internal/api/webdist/*
 !internal/api/webdist/.gitkeep
-web/.svelte-kit/
-web/build/
+node_modules/
 web/node_modules/
-
-# Misc
-.env
-*.log
+web/build/
+web/.svelte-kit/

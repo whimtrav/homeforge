@@ -5,11 +5,221 @@ services:
     container_name: homeforge
     restart: unless-stopped
     network_mode: host
+    depends_on:
+      - timescaledb
+      - ollama
     volumes:
       - ./config.yaml:/etc/homeforge/config.yaml:ro
       - homeforge_data:/data
     environment:
       - TZ=America/Denver
 
+  # Emporia Vue cloud bridge -> HomeForge MQTT (pyemvue sidecar). Creds in ./emporia/.env
+  emporia:
+    build: ./emporia
+    container_name: homeforge-emporia
+    restart: unless-stopped
+    network_mode: host
+    env_file: ./emporia/.env
+    environment:
+      - MQTT_HOST=127.0.0.1
+      - MQTT_PORT=1885
+      - MQTT_USER=homeforge
+      - MQTT_PASS=${MQTT_PASS}
+      - POLL_SECONDS=30
+      - TZ=America/Denver
+    depends_on:
+      - homeforge
+
+  # VeSync (Levoit/Etekcity) cloud bridge -> HomeForge MQTT. Creds in ./vesync/.env
+  vesync-bridge:
+    build: ./vesync
+    container_name: vesync-bridge
+    restart: unless-stopped
+    network_mode: host
+    env_file: ./vesync/.env
+    environment:
+      - MQTT_HOST=127.0.0.1
+      - MQTT_PORT=1885
+      - MQTT_USER=homeforge
+      - MQTT_PASS=${MQTT_PASS}
+      - HF_API=http://127.0.0.1:8093
+      - TZ=America/Denver
+    depends_on:
+      - homeforge
+
+  # Kidde HomeSafe (smoke/CO/water detectors) cloud bridge -> HomeForge MQTT. Creds in ./kidde/.env
+  kidde-bridge:
+    build: ./kidde
+    container_name: kidde-bridge
+    restart: unless-stopped
+    network_mode: host
+    env_file: ./kidde/.env
+    environment:
+      - MQTT_HOST=127.0.0.1
+      - MQTT_PORT=1885
+      - MQTT_USER=homeforge
+      - MQTT_PASS=${MQTT_PASS}
+      - POLL_SECONDS=30
+      - TZ=America/Denver
+    depends_on:
+      - homeforge
+
+  # Hubspace (Afero) lights/outlets/fans cloud bridge -> HomeForge MQTT. Creds in ./hubspace/.env
+  hubspace-bridge:
+    build: ./hubspace
+    container_name: hubspace-bridge
+    restart: unless-stopped
+    network_mode: host
+    env_file: ./hubspace/.env
+    environment:
+      - MQTT_HOST=127.0.0.1
+      - MQTT_PORT=1885
+      - MQTT_USER=homeforge
+      - MQTT_PASS=${MQTT_PASS}
+      - POLL_SECONDS=30
+      - TZ=America/Denver
+    depends_on:
+      - homeforge
+
+  # Zigbee2MQTT (SLZB-06P7 coordinator over TCP). Data/pairings in ../zigbee2mqtt;
+  # its configuration.yaml broker set to 127.0.0.1 (host-net) = host-agnostic.
+  zigbee2mqtt:
+    image: koenkk/zigbee2mqtt:latest
+    container_name: zigbee2mqtt
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../zigbee2mqtt:/app/data
+    environment:
+      - TZ=America/Denver
+    depends_on:
+      - homeforge
+
+  # Ring cloud bridge (tsightler/ring-mqtt). Bridge-net + web UI :55123; reaches the
+  # host broker via host.docker.internal (host-agnostic for the Beelink port).
+  ring-mqtt:
+    image: tsightler/ring-mqtt:latest
+    container_name: ring-mqtt
+    restart: unless-stopped
+    ports:
+      - "55123:55123"
+    volumes:
+      - ../ring-mqtt:/data
+    environment:
+      - MQTTHOST=host.docker.internal
+      - MQTTPORT=1885
+      - MQTTUSER=homeforge
+      - MQTTPASSWORD=${MQTT_PASS}
+      - TZ=America/Denver
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - homeforge
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: homeforge-timescaledb
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      - POSTGRES_DB=homeforge
+      - POSTGRES_USER=homeforge
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - TZ=America/Denver
+    volumes:
+      - homeforge_tsdb:/var/lib/postgresql/data
+    command:
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "max_connections=50"
+      - "-c"
+      - "synchronous_commit=off"
+
+  # Local LLM for the HomeForge assistant — CPU-ONLY, no GPU (so it ports to the Beelink
+  # Ryzen 5 5560U / any no-GPU box). Published on 11435 to avoid the NAS host ollama on
+  # 11434 (host ollama serves Sentinel's vision models); on the Beelink either port is fine.
+  # Sized for the 4-cpu / 8GB target: capped to 4 cpus + 6GB, single model, long keep-alive.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: homeforge-ollama
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11435:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_NUM_THREADS=4
+      - TZ=America/Denver
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 6g
+
+  # Local speech-to-text for the assistant's voice input — CPU-only (faster-whisper/CTranslate2),
+  # no cloud, no GPU. base.en is accurate enough for commands and light on the 8GB target (~0.5GB).
+  # POST audio to /asr → transcription. HF proxies it at /api/assistant/stt.
+  whisper:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: homeforge-whisper
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9010:9000"
+    environment:
+      - ASR_ENGINE=faster_whisper
+      - ASR_MODEL=base.en
+      - TZ=America/Denver
+    volumes:
+      - whisper_models:/root/.cache
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 2g
+
+  # Local neural TTS for the assistant's spoken replies — Piper, CPU-only, no cloud. British
+  # male voice (en_GB-alan-medium, "Jarvis"-ish); downloads the voice once into piper_models.
+  # POST text to /tts → WAV. HF proxies at /api/assistant/tts. Change PIPER_VOICE to swap voices.
+  piper:
+    build: ./piper
+    container_name: homeforge-piper
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5111:5050"
+    environment:
+      - PIPER_VOICE=en_GB-alan-medium
+      - TZ=America/Denver
+    volumes:
+      - piper_models:/models
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1g
+
+  # Cloudflare Tunnel → exposes HomeForge at https://homeforge.example.com with NO open ports
+  # (outbound-only). host-net so it reaches HF at localhost:8093. Token in ./.env (CF_TUNNEL_TOKEN).
+  # Auth is enforced by HomeForge itself (see internal/api/auth.go), not at the edge.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: homeforge-cloudflared
+    restart: unless-stopped
+    network_mode: host
+    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
+    environment:
+      - TZ=America/Denver
+    depends_on:
+      - homeforge
+
 volumes:
   homeforge_data:
+  homeforge_tsdb:
+  ollama_models:
+  whisper_models:
+  piper_models:

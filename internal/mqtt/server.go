@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 
 	mqttserver "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
@@ -24,16 +27,38 @@ type Message struct {
 	Payload []byte
 }
 
+// ringBinding maps a ring/ state topic to an entity + its value_template (multiple entities
+// can share one topic, e.g. battery + wifi both read the device's info/state JSON).
+type ringBinding struct {
+	entityID string
+	tmpl     string
+}
+
 type Server struct {
-	cfg     config.MQTTConfig
-	store   *entity.Store
-	bus     *bus.Bus
-	broker  *mqttserver.Server
-	client  mqttclient.Client
+	cfg    config.MQTTConfig
+	store  *entity.Store
+	bus    *bus.Bus
+	broker *mqttserver.Server
+	client mqttclient.Client
+
+	ringMu       sync.Mutex
+	ringBindings map[string][]ringBinding // state_topic -> entities that read it
 }
 
 func NewServer(cfg config.MQTTConfig, store *entity.Store, b *bus.Bus) (*Server, error) {
-	s := &Server{cfg: cfg, store: store, bus: b}
+	s := &Server{cfg: cfg, store: store, bus: b, ringBindings: map[string][]ringBinding{}}
+
+	// Handle service calls for MQTT-backed entities (Zigbee2MQTT, Tasmota).
+	b.Subscribe("service.call", func(ev bus.Event) {
+		payload, ok := ev.Payload.(map[string]any)
+		if !ok {
+			return
+		}
+		entityID, _ := payload["entity"].(string)
+		service, _ := payload["service"].(string)
+		data, _ := payload["data"].(map[string]any)
+		s.handleServiceCallMQTT(entityID, service, data)
+	})
 
 	if !cfg.External {
 		broker := mqttserver.New(&mqttserver.Options{})
@@ -78,6 +103,7 @@ func (s *Server) Run(ctx context.Context) {
 		AddBroker(broker).
 		SetClientID("homeforge").
 		SetAutoReconnect(true).
+		SetMessageChannelDepth(4096). // absorb bursts (ring-mqtt resends ~1800 discovery msgs at once)
 		SetOnConnectHandler(s.onConnect)
 
 	if s.cfg.Username != "" {
@@ -118,7 +144,35 @@ func (s *Server) onConnect(c mqttclient.Client) {
 	c.Subscribe("tele/+/STATE", 0, s.handleTasmota)
 
 	// Sentinel NVR detection events.
-	c.Subscribe("sentinel/+/detection/+", 0, s.handleSentinel)
+	c.Subscribe("frigate/events", 0, s.handleSentinel) // Sentinel/Frigate detection event stream (JSON)
+
+	// Solar Assistant telemetry, bridged in from its mosquitto (solar_assistant/{dev}/{metric}/state).
+	c.Subscribe("solar_assistant/#", 0, s.handleSolarAssistant)
+
+	// Emporia Vue per-channel power, published by the emporia sidecar (emporia/{key}/power).
+	c.Subscribe("emporia/#", 0, s.handleEmporia)
+
+	// VeSync cloud devices + ESF24 scale, published by the vesync-bridge sidecar (vesync/{dev}/{metric}).
+	c.Subscribe("vesync/+/+", 0, s.handleVeSync)
+
+	// Kidde HomeSafe smoke/CO/water detectors, published by the kidde-bridge sidecar (kidde/{dev}/{key}).
+	c.Subscribe("kidde/+/+", 0, s.handleKidde)
+
+	// Hubspace (Afero) lights/outlets/fans, published by the hubspace-bridge sidecar (hubspace/{dev}/{key}).
+	c.Subscribe("hubspace/+/+", 0, s.handleHubspace)
+
+	// Ring (ring-mqtt sidecar): HA discovery on homeassistant/# seeds entities; ring/# carries state.
+	c.Subscribe("ring/#", 0, s.handleRingState)
+
+	// Hydrific Droplet water sensor — plain MQTT (droplet-<id>/{state,leak,health})
+	c.Subscribe("droplet-FE5C/+", 0, s.handleDroplet)
+
+		// Tasmota auto-discovery (retained).
+	c.Subscribe("tasmota/discovery/#", 0, s.handleTasmotaDiscovery)
+
+	// LiquidFW device command subscriptions.
+	// HA sends: liquidfw/switch.liquidfw_test_led/set {state:on}
+	c.Subscribe("liquidfw/+/set", 0, s.handleLiquidFWSet)
 
 	// Forward all messages to automation engine.
 	c.Subscribe("#", 0, func(_ mqttclient.Client, msg mqttclient.Message) {
@@ -130,6 +184,11 @@ func (s *Server) onConnect(c mqttclient.Client) {
 
 	// Request Z2M to re-publish all device states.
 	c.Publish("zigbee2mqtt/bridge/request/devices", 0, false, "{}")
+
+	// Ring: ring-mqtt publishes discovery NON-retained and resends it on the HA "birth"
+	// message. Announce online so it re-publishes all Ring device configs to us on every
+	// (re)connect — this is how the HA addon works too.
+	c.Publish("homeassistant/status", 0, true, "online")
 }
 
 // handleHADiscovery parses retained HA MQTT discovery config messages to seed
@@ -141,14 +200,24 @@ func (s *Server) handleHADiscovery(_ mqttclient.Client, msg mqttclient.Message) 
 		return
 	}
 	domain := parts[1]
-	switch domain {
-	case "sensor", "binary_sensor", "light", "switch", "lock", "climate", "cover":
-	default:
-		return
-	}
 
 	var cfg map[string]any
 	if err := json.Unmarshal(msg.Payload(), &cfg); err != nil {
+		return
+	}
+
+	// Ring (ring-mqtt) uses device-based discovery with topics under ring/ — route it to a
+	// dedicated handler so its many devices get clean, non-colliding entities (the generic
+	// path below derives the name from the state_topic tail, which is "state" for every Ring
+	// device → collisions).
+	if st, _ := cfg["state_topic"].(string); strings.HasPrefix(st, "ring/") {
+		s.handleRingDiscovery(domain, cfg, st)
+		return
+	}
+
+	switch domain {
+	case "sensor", "binary_sensor", "light", "switch", "lock", "climate", "cover":
+	default:
 		return
 	}
 
@@ -222,6 +291,7 @@ func (s *Server) handleZigbee2MQTT(_ mqttclient.Client, msg mqttclient.Message) 
 	domain, state := inferDomainState(payload)
 	id := domain + "." + sanitizeID(deviceName)
 
+	payload["z2m_topic"] = deviceName
 	s.store.Set(entity.Entity{
 		ID:         id,
 		Name:       deviceName,
@@ -256,6 +326,7 @@ func (s *Server) handleTasmota(_ mqttclient.Client, msg mqttclient.Message) {
 	_ = msgType
 	if power, ok := payload["POWER"].(string); ok {
 		id := "switch." + sanitizeID(deviceName)
+		payload["tasmota_topic"] = deviceName
 		s.store.Set(entity.Entity{
 			ID:         id,
 			Name:       deviceName,
@@ -266,34 +337,708 @@ func (s *Server) handleTasmota(_ mqttclient.Client, msg mqttclient.Message) {
 	}
 }
 
+// handleSentinel ingests Sentinel's Frigate-compatible detection event stream:
+//   frigate/events → {"type":"new"|"update"|"end","after":{"camera","label",...}}
+// → binary_sensor.sentinel_{camera}_{label} = on while a detection is active, off on "end".
+// Good enough for "person/car at <camera>" automations. (The full JSON is kept in attributes.)
 func (s *Server) handleSentinel(_ mqttclient.Client, msg mqttclient.Message) {
-	// sentinel/{camera}/detection/{label}
-	parts := strings.Split(msg.Topic(), "/")
-	if len(parts) < 4 {
+	var ev struct {
+		Type  string `json:"type"`
+		After struct {
+			Camera   string  `json:"camera"`
+			Label    string  `json:"label"`
+			TopScore float64 `json:"top_score"`
+		} `json:"after"`
+	}
+	if json.Unmarshal(msg.Payload(), &ev) != nil || ev.After.Camera == "" || ev.After.Label == "" {
 		return
 	}
-	camera := parts[1]
-	label := parts[3]
-	id := fmt.Sprintf("binary_sensor.sentinel_%s_%s", sanitizeID(camera), sanitizeID(label))
-
-	var payload map[string]any
-	_ = json.Unmarshal(msg.Payload(), &payload)
-	if payload == nil {
-		payload = make(map[string]any)
-	}
-
 	state := "on"
-	if v, ok := payload["active"].(bool); ok && !v {
+	if ev.Type == "end" {
 		state = "off"
 	}
-
 	s.store.Set(entity.Entity{
-		ID:         id,
-		Name:       fmt.Sprintf("%s %s detected", camera, label),
-		Domain:     "binary_sensor",
-		State:      state,
-		Attributes: payload,
+		ID:     fmt.Sprintf("binary_sensor.sentinel_%s_%s", sanitizeID(ev.After.Camera), sanitizeID(ev.After.Label)),
+		Name:   fmt.Sprintf("%s %s", ev.After.Camera, ev.After.Label),
+		Domain: "binary_sensor",
+		State:  state,
+		Attributes: map[string]any{
+			"device": "sentinel", "section": "camera",
+			"camera": ev.After.Camera, "object": ev.After.Label, "score": ev.After.TopScore,
+		},
 	})
+}
+
+// handleSolarAssistant ingests Solar Assistant telemetry (bridged from its mosquitto).
+// Topic: solar_assistant/{device}/{metric}/state  payload = value.
+// Only numeric values are kept — that neatly drops the schedule/mode/boolean config topics
+// (charge slots, "Voltage", true/false, times) and keeps live power/voltage/current/soc/etc.
+func (s *Server) handleSolarAssistant(_ mqttclient.Client, msg mqttclient.Message) {
+	parts := strings.Split(msg.Topic(), "/")
+	if len(parts) != 4 || parts[3] != "state" {
+		return
+	}
+	val := strings.TrimSpace(string(msg.Payload()))
+	if _, err := strconv.ParseFloat(val, 64); err != nil {
+		return // non-numeric = config/schedule topic, skip
+	}
+	metric := parts[2]
+	s.store.Set(entity.Entity{
+		ID:     "sensor.solar_" + sanitizeID(metric),
+		Name:   "solar " + strings.ReplaceAll(metric, "_", " "),
+		Domain: "sensor",
+		State:  val,
+		Attributes: map[string]any{
+			"source":  "solar_assistant",
+			"metric":  metric,
+			"section": "solar",
+		},
+	})
+}
+
+// handleEmporia ingests Emporia Vue per-channel power from the sidecar.
+// Topic: emporia/{key}/power  payload = watts. "mains"/"balance" -> mains section
+// (kept SEPARATE from the Lux inverter's grid reading in the solar section).
+// kiddeBinary maps Kidde binary keys to a HA device_class ("" = none). Anything
+// published on kidde/{dev}/{key} not in this map is treated as a plain sensor.
+var kiddeBinary = map[string]string{
+	"smoke_alarm":       "smoke",
+	"co_alarm":          "carbon_monoxide",
+	"hardwire_smoke":    "smoke",
+	"too_much_smoke":    "smoke",
+	"water_alarm":       "moisture",
+	"low_temp_alarm":    "cold",
+	"low_battery_alarm": "battery",
+	"smoke_hushed":      "",
+	"contact_lost":      "",
+	"online":            "connectivity",
+}
+
+// kiddeUnits maps Kidde sensor keys to a unit of measurement.
+var kiddeUnits = map[string]string{
+	"batt_volt": "V", "battery_voltage": "V", "battery_level": "%",
+	"temperature": "°F", "iaq_temperature": "°C", "humidity": "%", "hpa": "hPa",
+	"tvoc": "ppb", "co2": "ppm", "ap_rssi": "dBm", "life": "weeks",
+}
+
+// handleKidde ingests Kidde HomeSafe detector state from the kidde-bridge sidecar
+// (kidde/{device}/{key} = value). Alarm/connectivity keys → binary_sensor, the rest
+// → sensor. Read-only (test/hush stay in the Kidde app). Mirrors handleVeSync.
+func (s *Server) handleKidde(_ mqttclient.Client, msg mqttclient.Message) {
+	parts := strings.Split(msg.Topic(), "/")
+	if len(parts) != 3 {
+		return
+	}
+	dev, key := parts[1], parts[2]
+	val := strings.TrimSpace(string(msg.Payload()))
+	if val == "" {
+		return
+	}
+	devName := strings.ReplaceAll(dev, "_", " ")
+
+	if dc, isBinary := kiddeBinary[key]; isBinary {
+		switch strings.ToLower(val) {
+		case "on", "true", "1":
+			val = "on"
+		case "off", "false", "0":
+			val = "off"
+		}
+		attrs := map[string]any{"source": "kidde", "device": dev, "section": "kidde"}
+		if dc != "" {
+			attrs["device_class"] = dc
+		}
+		s.store.Set(entity.Entity{
+			ID:     "binary_sensor.kidde_" + sanitizeID(dev) + "_" + sanitizeID(key),
+			Name:   devName + " " + strings.ReplaceAll(key, "_", " "),
+			Domain: "binary_sensor", State: val, Attributes: attrs,
+		})
+		return
+	}
+
+	attrs := map[string]any{"source": "kidde", "device": dev, "metric": key, "section": "kidde"}
+	if u, ok := kiddeUnits[key]; ok {
+		attrs["unit_of_measurement"] = u
+	}
+	s.store.Set(entity.Entity{
+		ID:     "sensor.kidde_" + sanitizeID(dev) + "_" + sanitizeID(key),
+		Name:   "kidde " + devName + " " + strings.ReplaceAll(key, "_", " "),
+		Domain: "sensor", State: val, Attributes: attrs,
+	})
+}
+
+// handleHubspace ingests Hubspace (Afero) device state from the hubspace-bridge
+// sidecar (hubspace/{device}/{key} = value). power → switch, brightness/speed →
+// number (controllable via handleServiceCallMQTT's hubspace branch → hubspace/{dev}/set),
+// everything else → sensor. Mirrors handleVeSync.
+func (s *Server) handleHubspace(_ mqttclient.Client, msg mqttclient.Message) {
+	parts := strings.Split(msg.Topic(), "/")
+	if len(parts) != 3 {
+		return
+	}
+	dev, key := parts[1], parts[2]
+	if key == "set" {
+		return // command topic echo
+	}
+	val := strings.TrimSpace(string(msg.Payload()))
+	if val == "" {
+		return
+	}
+	devName := strings.ReplaceAll(dev, "_", " ")
+
+	switch key {
+	case "power":
+		s.store.Set(entity.Entity{
+			ID: "switch.hubspace_" + sanitizeID(dev), Name: devName, Domain: "switch", State: val,
+			Attributes: map[string]any{"source": "hubspace", "device": dev, "section": "hubspace",
+				"hubspace_dev": dev, "hubspace_cmd": "power"},
+		})
+		return
+	case "brightness":
+		s.store.Set(entity.Entity{
+			ID: "number.hubspace_" + sanitizeID(dev) + "_brightness", Name: devName + " brightness",
+			Domain: "number", State: val,
+			Attributes: map[string]any{"source": "hubspace", "device": dev, "section": "hubspace",
+				"hubspace_dev": dev, "hubspace_cmd": "brightness", "min": 0, "max": 100, "step": 1,
+				"unit_of_measurement": "%"},
+		})
+		return
+	case "speed":
+		s.store.Set(entity.Entity{
+			ID: "number.hubspace_" + sanitizeID(dev) + "_speed", Name: devName + " speed",
+			Domain: "number", State: val,
+			Attributes: map[string]any{"source": "hubspace", "device": dev, "section": "hubspace",
+				"hubspace_dev": dev, "hubspace_cmd": "speed", "min": 0, "max": 100, "step": 1,
+				"unit_of_measurement": "%"},
+		})
+		return
+	}
+
+	attrs := map[string]any{"source": "hubspace", "device": dev, "metric": key, "section": "hubspace"}
+	if key == "wifi_rssi" {
+		attrs["unit_of_measurement"] = "dBm"
+	}
+	s.store.Set(entity.Entity{
+		ID:     "sensor.hubspace_" + sanitizeID(dev) + "_" + sanitizeID(key),
+		Name:   "hubspace " + devName + " " + strings.ReplaceAll(key, "_", " "),
+		Domain: "sensor", State: val, Attributes: attrs,
+	})
+}
+
+func (s *Server) handleEmporia(_ mqttclient.Client, msg mqttclient.Message) {
+	parts := strings.Split(msg.Topic(), "/")
+	if len(parts) != 3 || parts[2] != "power" {
+		return
+	}
+	val := strings.TrimSpace(string(msg.Payload()))
+	if _, err := strconv.ParseFloat(val, 64); err != nil {
+		return
+	}
+	key := parts[1]
+	section := "circuits"
+	if key == "mains" || key == "balance" {
+		section = "mains"
+	}
+	s.store.Set(entity.Entity{
+		ID:     "sensor.emporia_" + sanitizeID(key),
+		Name:   "Emporia " + strings.ReplaceAll(key, "_", " "),
+		Domain: "sensor",
+		State:  val,
+		Attributes: map[string]any{
+			"source":              "emporia",
+			"section":             section,
+			"unit_of_measurement": "W",
+		},
+	})
+}
+
+// handleVeSync ingests VeSync cloud device + scale metrics from the vesync-bridge sidecar.
+// Topic: vesync/{dev}/{metric}  payload = value. Covers the Levoit air purifier + the two
+// humidifiers (live state) and the Etekcity ESF24 Bluetooth scale (weight/bmi/height from the
+// last synced weigh-in). Scale weight/bmi ALSO flow to the Health tab via the bridge's
+// POST to /api/health; these entities are the device-view mirror.
+func (s *Server) handleVeSync(_ mqttclient.Client, msg mqttclient.Message) {
+	parts := strings.Split(msg.Topic(), "/")
+	if len(parts) != 3 {
+		return
+	}
+	dev, metric := parts[1], parts[2]
+	val := strings.TrimSpace(string(msg.Payload()))
+	if val == "" {
+		return
+	}
+	devName := strings.ReplaceAll(dev, "_", " ")
+
+	// Control metrics become controllable switch/number entities (dispatched by
+	// handleServiceCallMQTT via the vesync_dev/vesync_cmd attributes -> vesync/<dev>/set).
+	switch metric {
+	case "power":
+		s.store.Set(entity.Entity{
+			ID: "switch.vesync_" + sanitizeID(dev), Name: devName, Domain: "switch", State: val,
+			Attributes: map[string]any{"source": "vesync", "device": dev, "section": "vesync",
+				"vesync_dev": dev, "vesync_cmd": "power"},
+		})
+		return
+	case "fan":
+		s.store.Set(entity.Entity{
+			ID: "number.vesync_" + sanitizeID(dev) + "_fan", Name: devName + " fan", Domain: "number", State: val,
+			Attributes: map[string]any{"source": "vesync", "device": dev, "section": "vesync",
+				"vesync_dev": dev, "vesync_cmd": "fan", "min": 0, "max": 4, "step": 1, "zero_label": "Auto"},
+		})
+		return
+	case "humidity_target":
+		s.store.Set(entity.Entity{
+			ID: "number.vesync_" + sanitizeID(dev) + "_humidity_target", Name: devName + " target RH",
+			Domain: "number", State: val,
+			Attributes: map[string]any{"source": "vesync", "device": dev, "section": "vesync",
+				"vesync_dev": dev, "vesync_cmd": "humidity", "min": 40, "max": 80, "step": 5,
+				"unit_of_measurement": "%"},
+		})
+		return
+	}
+
+	attrs := map[string]any{
+		"source":  "vesync",
+		"device":  dev,
+		"metric":  metric,
+		"section": "vesync",
+	}
+	switch metric {
+	case "weight_lb", "target_weight_lb":
+		attrs["unit_of_measurement"] = "lb"
+	case "weight_kg":
+		attrs["unit_of_measurement"] = "kg"
+	case "height_cm":
+		attrs["unit_of_measurement"] = "cm"
+	case "humidity", "filter_life":
+		attrs["unit_of_measurement"] = "%"
+	case "air_quality_value", "pm25":
+		attrs["unit_of_measurement"] = "µg/m³"
+	}
+	s.store.Set(entity.Entity{
+		ID:         "sensor.vesync_" + sanitizeID(dev) + "_" + sanitizeID(metric),
+		Name:       "vesync " + devName + " " + strings.ReplaceAll(metric, "_", " "),
+		Domain:     "sensor",
+		State:      val,
+		Attributes: attrs,
+	})
+}
+
+// ringValueKey extracts the JSON field from a ring-mqtt value_template, e.g.
+// `{{ value_json["batteryLevel"] | default("") }}` or `{{ value_json.wirelessSignal }}`.
+var ringValueKey = regexp.MustCompile(`value_json(?:\[["']|\.)([A-Za-z0-9_]+)`)
+
+// handleRingDiscovery seeds a clean entity from a ring-mqtt HA-discovery config and registers
+// its state binding. Entity id = device name + component (unique in practice; falls back to
+// unique_id). Multiple entities can share one state_topic (info/state → battery, wifi, …).
+func (s *Server) handleRingDiscovery(domain string, cfg map[string]any, stateTopic string) {
+	switch domain {
+	case "binary_sensor", "sensor", "switch", "lock", "alarm_control_panel":
+	default:
+		return // skip camera/button/number/select for now
+	}
+	name, _ := cfg["name"].(string)
+	uniq, _ := cfg["unique_id"].(string)
+	devName := ""
+	if dev, ok := cfg["device"].(map[string]any); ok {
+		devName, _ = dev["name"].(string)
+	}
+	// ring-mqtt leaves the primary entity's name empty (HA convention: it inherits the device
+	// name). Use the device name alone for that; device+component for the rest.
+	slug := ""
+	primary := name == "" || strings.EqualFold(name, devName)
+	switch {
+	case devName != "" && primary:
+		slug = devName
+	case devName != "" && name != "":
+		slug = devName + " " + name
+	case uniq != "":
+		slug = uniq
+	case name != "":
+		slug = name
+	default:
+		return
+	}
+	id := domain + "." + sanitizeID(slug)
+	tmpl, _ := cfg["value_template"].(string)
+
+	s.ringMu.Lock()
+	dup := false
+	for _, b := range s.ringBindings[stateTopic] {
+		if b.entityID == id {
+			dup = true
+			break
+		}
+	}
+	if !dup {
+		s.ringBindings[stateTopic] = append(s.ringBindings[stateTopic], ringBinding{entityID: id, tmpl: tmpl})
+	}
+	s.ringMu.Unlock()
+
+	if existing, ok := s.store.Get(id); ok && existing.State != "unknown" {
+		return // keep live state
+	}
+	friendly := name
+	if devName != "" && primary {
+		friendly = devName
+	} else if devName != "" {
+		friendly = devName + " " + name
+	}
+	attrs := map[string]any{"source": "ring", "section": "ring", "device": sanitizeID(devName),
+		"friendly_name": friendly, "state_topic": stateTopic, "unique_id": uniq}
+	if dc, ok := cfg["device_class"].(string); ok && dc != "" {
+		attrs["device_class"] = dc
+	}
+	if u, ok := cfg["unit_of_measurement"].(string); ok && u != "" {
+		attrs["unit_of_measurement"] = u
+	}
+	if ct, ok := cfg["command_topic"].(string); ok && ct != "" {
+		attrs["command_topic"] = ct
+	}
+	s.store.Set(entity.Entity{ID: id, Name: friendly, Domain: domain, State: "unknown", Attributes: attrs})
+}
+
+// handleRingState updates Ring entities as state arrives on ring/# topics.
+func (s *Server) handleRingState(_ mqttclient.Client, msg mqttclient.Message) {
+	topic := msg.Topic()
+	s.ringMu.Lock()
+	bindings := append([]ringBinding(nil), s.ringBindings[topic]...)
+	s.ringMu.Unlock()
+	if len(bindings) == 0 {
+		return
+	}
+	payload := msg.Payload()
+	for _, b := range bindings {
+		val, ok := ringExtract(payload, b.tmpl)
+		if !ok || val == "" {
+			continue
+		}
+		switch {
+		case strings.EqualFold(val, "ON"):
+			val = "on"
+		case strings.EqualFold(val, "OFF"):
+			val = "off"
+		case strings.EqualFold(val, "LOCKED"):
+			val = "locked"
+		case strings.EqualFold(val, "UNLOCKED"):
+			val = "unlocked"
+		}
+		e, ok := s.store.Get(b.entityID)
+		if !ok || e.State == val {
+			continue
+		}
+		e.State = val
+		s.store.Set(e)
+	}
+}
+
+// ringExtract pulls the value for an entity from a ring state payload, applying the
+// value_template's JSON field when present, else using the raw payload.
+func ringExtract(payload []byte, tmpl string) (string, bool) {
+	if strings.TrimSpace(tmpl) == "" {
+		return strings.TrimSpace(string(payload)), true
+	}
+	m := ringValueKey.FindStringSubmatch(tmpl)
+	if m == nil {
+		return strings.TrimSpace(string(payload)), true
+	}
+	var obj map[string]any
+	if json.Unmarshal(payload, &obj) != nil {
+		return "", false
+	}
+	v, ok := obj[m[1]]
+	if !ok || v == nil {
+		return "", false
+	}
+	switch n := v.(type) {
+	case float64:
+		return strconv.FormatFloat(n, 'f', -1, 64), true
+	case bool:
+		if n {
+			return "on", true
+		}
+		return "off", true
+	case string:
+		return n, true
+	default:
+		return fmt.Sprintf("%v", v), true
+	}
+}
+
+// handleTasmotaDiscovery parses retained Tasmota auto-discovery messages to seed
+// entities. Topic: tasmota/discovery/{mac}/config
+func (s *Server) handleTasmotaDiscovery(_ mqttclient.Client, msg mqttclient.Message) {
+	parts := strings.Split(msg.Topic(), "/")
+	if len(parts) < 4 || parts[len(parts)-1] != "config" {
+		return
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal(msg.Payload(), &cfg); err != nil {
+		return
+	}
+
+	topic, _ := cfg["t"].(string)
+	if topic == "" {
+		return
+	}
+
+	deviceName, _ := cfg["dn"].(string)
+	if deviceName == "" {
+		deviceName = topic
+	}
+
+	rl, _ := cfg["rl"].([]any)
+	fn, _ := cfg["fn"].([]any)
+
+	// Count active relays to decide whether to add index suffixes.
+	activeRelays := 0
+	for _, v := range rl {
+		if f, ok := v.(float64); ok && int(f) != 0 {
+			activeRelays++
+		}
+	}
+
+	for i, v := range rl {
+		f, ok := v.(float64)
+		if !ok {
+			continue
+		}
+		relayType := int(f)
+		if relayType == 0 {
+			continue
+		}
+
+		domain := "switch"
+		if relayType == 3 {
+			domain = "light"
+		}
+
+		name := deviceName
+		if i < len(fn) {
+			if n, ok := fn[i].(string); ok && n != "" {
+				name = n
+			}
+		}
+
+		entityID := domain + "." + sanitizeID(topic)
+		if activeRelays > 1 {
+			entityID = fmt.Sprintf("%s.%s_%d", domain, sanitizeID(topic), i+1)
+		}
+
+		if existing, exists := s.store.Get(entityID); exists && existing.State != "unknown" {
+			continue
+		}
+
+		s.store.Set(entity.Entity{
+			ID:     entityID,
+			Name:   name,
+			Domain: domain,
+			State:  "unknown",
+			Attributes: map[string]any{
+				"tasmota_topic": topic,
+				"source":        "tasmota",
+			},
+		})
+	}
+}
+
+// handleLiquidFWSet handles HA command messages for LiquidFW entities.
+// Topic: liquidfw/{entity_id}/set  Payload: {state:on} or {value:128}
+func (s *Server) handleLiquidFWSet(_ mqttclient.Client, msg mqttclient.Message) {
+	parts := strings.Split(msg.Topic(), "/")
+	slog.Info("liquidfw: mqtt cmd recv", "topic", msg.Topic(), "parts", len(parts), "payload", string(msg.Payload()))
+	if len(parts) < 3 {
+		return
+	}
+	entityID := parts[1]
+	s.bus.Publish("liquidfw.cmd", map[string]any{
+		"entity_id": entityID,
+		"raw":       msg.Payload(),
+	})
+}
+
+// handleServiceCallMQTT publishes MQTT commands for Zigbee2MQTT and Tasmota entities.
+func (s *Server) handleServiceCallMQTT(entityID, service string, data map[string]any) {
+	if s.client == nil {
+		return
+	}
+
+	e, ok := s.store.Get(entityID)
+	if !ok {
+		return
+	}
+
+	if _, isWiz := e.Attributes["wiz_mac"]; isWiz {
+		return // WiZ handled by the wiz integration directly, not via MQTT
+	}
+	if _, isWled := e.Attributes["wled_host"]; isWled {
+		return // WLED handled by the wled integration directly
+	}
+
+	// Ring devices: publish HA-standard payloads to the entity's command_topic (ring-mqtt sidecar).
+	if src, _ := e.Attributes["source"].(string); src == "ring" {
+		ct, _ := e.Attributes["command_topic"].(string)
+		if ct == "" {
+			return
+		}
+		lc := strings.ToLower(service)
+		payload := ""
+		switch {
+		case strings.HasSuffix(lc, ".alarm_disarm"):
+			payload = "DISARM"
+		case strings.HasSuffix(lc, ".alarm_arm_home"):
+			payload = "ARM_HOME"
+		case strings.HasSuffix(lc, ".alarm_arm_away"):
+			payload = "ARM_AWAY"
+		case strings.HasSuffix(lc, ".alarm_arm_night"):
+			payload = "ARM_NIGHT"
+		case strings.HasSuffix(lc, ".lock"):
+			payload = "LOCK"
+		case strings.HasSuffix(lc, ".unlock"):
+			payload = "UNLOCK"
+		case strings.HasSuffix(lc, ".turn_on"):
+			payload = "ON"
+		case strings.HasSuffix(lc, ".turn_off"):
+			payload = "OFF"
+		case strings.HasSuffix(lc, ".toggle"):
+			if e.State == "on" {
+				payload = "OFF"
+			} else {
+				payload = "ON"
+			}
+		default:
+			return
+		}
+		s.Publish(ct, []byte(payload))
+		slog.Info("ring: command", "entity", entityID, "payload", payload)
+		return
+	}
+
+	// VeSync devices: publish a command to vesync/<dev>/set for the vesync-bridge sidecar.
+	if dev, isVesync := e.Attributes["vesync_dev"].(string); isVesync {
+		cmd, _ := e.Attributes["vesync_cmd"].(string)
+		lc := strings.ToLower(service)
+		topic := fmt.Sprintf("vesync/%s/set", dev)
+		if strings.HasSuffix(lc, ".set_value") { // number: fan / humidity
+			if val, ok := data["value"]; ok {
+				payload, _ := json.Marshal(map[string]any{cmd: val})
+				s.Publish(topic, payload)
+			}
+			return
+		}
+		var on bool // switch: power
+		switch {
+		case strings.HasSuffix(lc, ".turn_on"):
+			on = true
+		case strings.HasSuffix(lc, ".turn_off"):
+			on = false
+		case strings.HasSuffix(lc, ".toggle"):
+			on = e.State != "on"
+		default:
+			return
+		}
+		st := "off"
+		if on {
+			st = "on"
+		}
+		payload, _ := json.Marshal(map[string]any{"power": st})
+		s.Publish(topic, payload)
+		return
+	}
+
+	// Hubspace devices: publish a command to hubspace/<dev>/set for the hubspace-bridge sidecar.
+	if dev, isHub := e.Attributes["hubspace_dev"].(string); isHub {
+		cmd, _ := e.Attributes["hubspace_cmd"].(string)
+		lc := strings.ToLower(service)
+		topic := fmt.Sprintf("hubspace/%s/set", dev)
+		if strings.HasSuffix(lc, ".set_value") { // number: brightness / speed
+			if val, ok := data["value"]; ok {
+				payload, _ := json.Marshal(map[string]any{cmd: val})
+				s.Publish(topic, payload)
+			}
+			return
+		}
+		var on bool // switch: power
+		switch {
+		case strings.HasSuffix(lc, ".turn_on"):
+			on = true
+		case strings.HasSuffix(lc, ".turn_off"):
+			on = false
+		case strings.HasSuffix(lc, ".toggle"):
+			on = e.State != "on"
+		default:
+			return
+		}
+		st := "off"
+		if on {
+			st = "on"
+		}
+		payload, _ := json.Marshal(map[string]any{"power": st})
+		s.Publish(topic, payload)
+		return
+	}
+
+	lc := strings.ToLower(service)
+
+	// number.set_value — a numeric value (e.g. iFan04 speed 0-3) carried in data["value"].
+	// Only LiquidFW number entities are wired for this today.
+	if strings.HasSuffix(lc, ".set_value") {
+		val, ok := data["value"]
+		if !ok {
+			return
+		}
+		if _, ok := e.Attributes["device"].(string); ok {
+			payload, _ := json.Marshal(map[string]any{"value": val})
+			s.Publish(fmt.Sprintf("liquidfw/%s/set", entityID), payload)
+		}
+		return
+	}
+
+	var on bool
+	switch {
+	case strings.HasSuffix(lc, ".turn_on"):
+		on = true
+	case strings.HasSuffix(lc, ".turn_off"):
+		on = false
+	case strings.HasSuffix(lc, ".toggle"):
+		on = e.State != "on"
+	default:
+		return
+	}
+
+	state := "OFF"
+	if on {
+		state = "ON"
+	}
+
+	// Tasmota entities carry tasmota_topic in their attributes.
+	if t, ok := e.Attributes["tasmota_topic"].(string); ok {
+		s.Publish(fmt.Sprintf("cmnd/%s/POWER", t), []byte(state))
+		return
+	}
+
+	// Zigbee2MQTT entities carry z2m_topic in their attributes.
+	if t, ok := e.Attributes["z2m_topic"].(string); ok {
+		payload, _ := json.Marshal(map[string]any{"state": state})
+		s.Publish(fmt.Sprintf("zigbee2mqtt/%s/set", t), payload)
+		return
+	}
+
+	// LiquidFW entities carry "device" attribute.
+	if _, ok := e.Attributes["device"].(string); ok {
+		payload, _ := json.Marshal(map[string]any{"state": state})
+		s.Publish(fmt.Sprintf("liquidfw/%s/set", entityID), payload)
+		return
+	}
+
+	// Sonoff entities carry "sonoff_device" attribute.
+	if _, ok := e.Attributes["sonoff_device"].(string); ok {
+		s.bus.Publish("sonoff.cmd", map[string]any{
+			"entity_id": entityID,
+			"state":     state,
+		})
+		return
+	}
 }
 
 // Publish sends a message to the MQTT broker.
