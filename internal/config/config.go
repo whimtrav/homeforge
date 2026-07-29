@@ -191,6 +191,15 @@ type ClimateBrainConfig struct {
 	NightFanStart  int     `yaml:"night_fan_start"`   // window start hour, local 0-23 (default 22)
 	NightFanEnd    int     `yaml:"night_fan_end"`     // window end hour, local 0-23 (default 6)
 
+	// ── Hot-day upstairs Heat-Guard: when it's hot out and upstairs is over its cap, drive the
+	// setpoint DOWN to pull UPSTAIRS (not the up/down average) to the cap + run the fans. The
+	// average-based thermostat won't do this on its own, so upstairs sits warm on hot afternoons.
+	HeatGuard        bool    `yaml:"heat_guard"`
+	HeatGuardHotOut  float64 `yaml:"heat_guard_hot_out"` // engage only when outdoor ≥ this °F (default 88)
+	HeatGuardCap     float64 `yaml:"heat_guard_cap"`     // max upstairs °F allowed on a hot day (default 75)
+	HeatGuardFloor   float64 `yaml:"heat_guard_floor"`   // hard floor — never command below this °F (default 70)
+	HeatGuardMaxDrop float64 `yaml:"heat_guard_max_drop"` // max °F below base the guard will command (default 4)
+
 	// ── Unified comfort-at-least-cost policy: ONE objective loop (keep the warm zone under the
 	// comfort ceiling using the cheapest sufficient actuator) that will replace the pile of
 	// individual modes. Runs in SHADOW (advisory, publishes what it WOULD do) until policy_actuate.

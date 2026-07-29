@@ -72,6 +72,11 @@ type Manager struct {
 
 	warmHist []tempSample // recent warm-zone feels-like samples (unified-policy trend)
 
+	// hot-day upstairs Heat-Guard: on a hot day, drive the setpoint DOWN to pull UPSTAIRS
+	// (not the up/down average) to a comfort cap, and run the fans to break stratification.
+	heatGuarding bool
+	hgLastCmd    float64 // last setpoint Heat-Guard commanded (override detection)
+
 	comfortSet float64 // learned comfortable setpoint (°F)
 	comfortN   int
 
@@ -204,8 +209,18 @@ func (m *Manager) tick(now time.Time) {
 			m.handleAttic(now, qualify, upF, cooling)
 		}
 
+		// ── hot-day upstairs Heat-Guard: when it's hot out and upstairs is over its comfort
+		// cap, cool HARDER (drop the setpoint, run the fans) until upstairs is comfortable —
+		// the average-based thermostat won't do this on its own. Owns the setpoint when engaged.
+		guarding := m.handleHeatGuard(haveOut, outdoor, haveUp, upF, haveSet, setpoint)
+
 		// ── solar pre-cool: actuate (or advise) ──────────────────────────────────
-		m.handlePrecool(mode, haveSet, setpoint, haveCur, current, grid, haveOut, outdoor)
+		// Skip while Heat-Guard owns the setpoint (comfort target already below any precool target).
+		if guarding {
+			m.precooling = false
+		} else {
+			m.handlePrecool(mode, haveSet, setpoint, haveCur, current, grid, haveOut, outdoor)
+		}
 	}
 
 	// ── unified policy: one objective loop, shadow unless policy_actuate ──────
@@ -665,6 +680,99 @@ func (m *Manager) handlePrecool(mode string, haveSet bool, setpoint float64, hav
 		Attributes: map[string]any{"device": "climate-brain", "section": "climate",
 			"precooling": m.precooling, "base_setpoint": round1(m.baseSet), "target": round1(target)},
 	})
+}
+
+// handleHeatGuard protects upstairs comfort on a hot day. The on-device thermostat holds the
+// AVERAGE of the upstairs + downstairs probes, so on a hot afternoon it will happily sit with
+// upstairs at 77-78 and downstairs at 71 and call it satisfied. This says: it's hot out AND
+// upstairs is over its cap → that's unacceptable → drop the setpoint enough to pull UPSTAIRS
+// (not the average) down to the cap, and run the attic + box fans to break the stratification.
+// Adaptive: the hotter it is outside, the tighter the cap. Returns true while it owns the setpoint.
+//
+// Safety: hard floor on the commanded setpoint (never freeze downstairs), bounded max drop,
+// stands down the instant the user moves the setpoint, and the on-device 300s min-cycle is intact.
+func (m *Manager) handleHeatGuard(haveOut bool, outdoor float64, haveUp bool, upF float64, haveSet bool, setpoint float64) bool {
+	if !m.cfg.HeatGuard {
+		return false
+	}
+	hotOut := orFloat(m.cfg.HeatGuardHotOut, 88) // "super hot" outside threshold °F
+	upCap := orFloat(m.cfg.HeatGuardCap, 75)       // max upstairs °F allowed on a hot day
+	floorF := orFloat(m.cfg.HeatGuardFloor, 70)  // never command the setpoint below this °F
+	maxDrop := orFloat(m.cfg.HeatGuardMaxDrop, 4)
+
+	// Track the user's base setpoint + honor manual overrides (same discipline as pre-cool).
+	if haveSet {
+		switch {
+		case !m.haveBase:
+			m.baseSet, m.haveBase = setpoint, true
+		case m.heatGuarding && math.Abs(setpoint-m.hgLastCmd) > 0.4:
+			m.baseSet, m.heatGuarding = setpoint, false // user moved it → adopt + stand down
+			slog.Info("climatebrain: heat-guard override — user changed setpoint", "to", setpoint)
+		case !m.heatGuarding && math.Abs(setpoint-m.baseSet) > 0.4:
+			m.baseSet = setpoint
+		}
+	}
+
+	// Adaptive upCap: tighten by up to 1°F as outdoor climbs past the threshold toward ~98.
+	if haveOut && outdoor > hotOut {
+		upCap -= math.Min(1, (outdoor-hotOut)/10)
+	}
+
+	engaged := haveOut && haveUp && m.haveBase && outdoor >= hotOut
+	over := upF - upCap
+
+	target := m.baseSet
+	reason := ""
+	switch {
+	case !engaged:
+		reason = fmt.Sprintf("not hot out (%.0f<%.0f)", outdoor, hotOut)
+	case over <= 0:
+		reason = fmt.Sprintf("upstairs %.1f ≤ upCap %.1f", upF, upCap)
+	default:
+		// Push the setpoint below base by the upstairs overshoot (avg-based thermostat tracks
+		// ~1:1 at steady state), bounded by max-drop and the hard floor.
+		target = m.baseSet - math.Min(over, maxDrop)
+		if target < floorF {
+			target = floorF
+		}
+	}
+
+	if engaged && over > 0 {
+		// attack the stratification directly with the fans
+		m.command(m.atticFanID(), true)
+		m.command(m.boxFanID(), true)
+		m.arm = "" // a forced-on fan voids any attic A/B arm in progress
+		if !m.heatGuarding || math.Abs(setpoint-target) > 0.4 {
+			m.setTemp(target)
+			m.hgLastCmd = target
+			m.heatGuarding = true
+			slog.Info("climatebrain: HEAT-GUARD cooling upstairs", "upstairs", round1(upF),
+				"upCap", round1(upCap), "outdoor", round1(outdoor), "target", round1(target), "base", round1(m.baseSet))
+		}
+	} else if m.heatGuarding {
+		// upstairs back under the upCap (with hysteresis) or no longer hot → restore the base setpoint
+		if !engaged || upF <= upCap-0.5 {
+			m.setTemp(m.baseSet)
+			m.hgLastCmd = m.baseSet
+			m.heatGuarding = false
+			m.command(m.boxFanID(), false) // release the box fan; leave attic to its own logic
+			slog.Info("climatebrain: heat-guard release → restore", "base", round1(m.baseSet), "reason", reason)
+		}
+	}
+
+	state := "hold"
+	if m.heatGuarding {
+		state = fmt.Sprintf("GUARDING upstairs %.1f→%.0f (setpoint %.0f, out %.0f)", upF, upCap, target, outdoor)
+	} else if reason != "" {
+		state = "hold (" + reason + ")"
+	}
+	m.store.Set(entity.Entity{
+		ID: "sensor.climatebrain_heatguard", Name: "Climate Brain Heat-Guard", Domain: "sensor", State: state,
+		Attributes: map[string]any{"device": "climate-brain", "section": "climate",
+			"guarding": m.heatGuarding, "upstairs": round1(upF), "upCap": round1(upCap),
+			"outdoor": round1(outdoor), "target": round1(target), "base_setpoint": round1(m.baseSet)},
+	})
+	return m.heatGuarding
 }
 
 // publishPrecoolAdvisory = the v1 recommend-only path (when precool_actuate is off).
