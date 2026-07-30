@@ -1034,6 +1034,7 @@ func (s *Server) handleServiceCall(w http.ResponseWriter, r *http.Request) {
 		"service": domain + "." + service,
 		"entity":  entityID,
 		"data":    data,
+		"source":  "user", // API is auth-gated → a human via the UI/app
 	})
 
 	w.WriteHeader(http.StatusOK)

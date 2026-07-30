@@ -38,6 +38,7 @@ const (
 	tickEvery    = 60 * time.Second
 	stateFile    = "/data/climate-brain-state.json"
 	comfortFile  = "/data/comfort-feedback.jsonl"
+	overrideFile = "/data/setpoint-overrides.jsonl" // manual-override context log (comfort learning)
 	comfortEvery = 10 // recompute the comfort model every N ticks (~10 min)
 )
 
@@ -76,6 +77,14 @@ type Manager struct {
 	// (not the up/down average) to a comfort cap, and run the fans to break stratification.
 	heatGuarding bool
 	hgLastCmd    float64 // last setpoint Heat-Guard commanded (override detection)
+
+	// holistic per-room comfort model (see zones.go) — per-room running state
+	zones map[string]*zoneRuntime
+
+	// manual-override hold: the unix-ts of the last user setpoint change we've already reacted to
+	// (so we log/adopt each override once). See the manual-hold block in tick().
+	lastOverrideTs int64
+	holdStatus     string // non-empty while in a manual-override hold → shown as the brain status
 
 	comfortSet float64 // learned comfortable setpoint (°F)
 	comfortN   int
@@ -161,6 +170,8 @@ func (m *Manager) tick(now time.Time) {
 	mode, hvac := "", ""
 	var setpoint, current float64
 	var haveSet, haveCur bool
+	spSource := ""
+	var spChanged int64
 	if e, ok := m.store.Get("climate.house"); ok {
 		mode = e.State
 		if a, ok := e.Attributes["hvac_action"].(string); ok {
@@ -172,54 +183,86 @@ func (m *Manager) tick(now time.Time) {
 		if v, ok := toF(e.Attributes["current_temperature"]); ok {
 			current, haveCur = v, true
 		}
+		// setpoint provenance stamped by the thermostat (who last moved it + when)
+		spSource, _ = e.Attributes["setpoint_source"].(string)
+		switch v := e.Attributes["setpoint_changed"].(type) {
+		case int64:
+			spChanged = v
+		case int:
+			spChanged = int64(v)
+		case float64:
+			spChanged = int64(v)
+		}
 	}
 	atticFan := m.switchState(m.atticFanID())
 	boxFan := m.switchState(m.boxFanID())
 	cooling := hvac == "cooling"
 
-	// ── night fan test: overnight, when it's cool enough out, back off the AC toward a
-	// comfort cap and run the attic+box fans — the "can fans hold it without the compressor"
-	// experiment. Stays in cool mode (AC always armed as a fail-safe). Owns the actuators and
-	// supersedes the daytime free-cool / attic / pre-cool logic while active.
-	nightActive := m.handleNightFan(now, haveOut, outdoor, haveUp, upF, haveSet, setpoint, haveCur, current)
+	// ── manual-override hold: when the user sets the setpoint himself (UI/assistant), HIS value wins
+	// for at least ManualHoldMin — the brain + all controllers hand off. Uses the provenance the
+	// thermostat stamps on climate.house, so we never GUESS whether a change was his or ours. A new
+	// override also becomes the authoritative base + gets its full context logged as a comfort signal.
+	manualHold := false
+	if (spSource == "user" || spSource == "assistant") && spChanged > 0 {
+		holdSec := int64(orFloat(m.cfg.ManualHoldMin, 60) * 60)
+		if now.Unix()-spChanged < holdSec {
+			manualHold = true
+		}
+		if spChanged != m.lastOverrideTs { // a NEW manual override just happened
+			m.lastOverrideTs = spChanged
+			if haveSet {
+				m.baseSet, m.haveBase = setpoint, true // his value is now the authoritative base
+			}
+			// clean hands-off: drop our controller state + stop our fans so nothing lingers or "restores"
+			m.precooling, m.heatGuarding, m.nightFanning, m.freeCooling, m.arm = false, false, false, false, ""
+			m.command(m.atticFanID(), false)
+			m.command(m.boxFanID(), false)
+			m.logOverride(now, spSource, setpoint, feelsUp, feelsDown, haveOut, outdoor)
+			slog.Info("climatebrain: MANUAL override — handing off", "source", spSource,
+				"setpoint", round1(setpoint), "hold_min", orFloat(m.cfg.ManualHoldMin, 60))
+		}
+	}
 
 	qualify := false
-	if nightActive {
-		m.freeCooling = false
-		m.arm = ""
+	m.holdStatus = ""
+	if manualHold {
+		// Hands off — the brain observes only; the on-device thermostat holds the user's setpoint.
+		// (Status is applied in publish() so nothing overwrites it later in the tick.)
+		mins := int64(orFloat(m.cfg.ManualHoldMin, 60)) - (now.Unix()-spChanged)/60
+		if mins < 0 {
+			mins = 0
+		}
+		m.holdStatus = fmt.Sprintf("MANUAL HOLD — you set %.0f°F; brain resumes in ~%d min", setpoint, mins)
 	} else {
-		// ── free cooling: when it's meaningfully cooler outside than upstairs and the house
-		// is above the setpoint, pull cool air through with the attic+box fans so the AC can
-		// cycle off (the wasted overnight/evening window). Never disables the AC — the
-		// thermostat still holds comfort if the fans can't keep up. Takes the fans over the
-		// hot-day attic A/B experiment.
-		target := 74.0
-		if haveSet {
-			target = setpoint
-		} else if m.haveBase {
-			target = m.baseSet
-		}
-		freeCoolActive := m.handleFreeCool(haveOut, outdoor, haveUp, upF, target)
-
-		// ── attic fan: experiment until verdict, then auto-run if it helps ────────
-		qualify = m.cfg.AtticExperiment && haveOut && haveUp && outdoor > upF+1 && pv > 200
-		if freeCoolActive {
-			m.arm = "" // free-cool owns the fans; not in an A/B arm
+		// ── night fan test: overnight, back off the AC toward a comfort cap + run the fans (the
+		// "can fans hold it without the compressor" experiment). Stays in cool mode (AC armed).
+		nightActive := m.handleNightFan(now, haveOut, outdoor, haveUp, upF, haveSet, setpoint, haveCur, current)
+		if nightActive {
+			m.freeCooling = false
+			m.arm = ""
 		} else {
-			m.handleAttic(now, qualify, upF, cooling)
-		}
-
-		// ── hot-day upstairs Heat-Guard: when it's hot out and upstairs is over its comfort
-		// cap, cool HARDER (drop the setpoint, run the fans) until upstairs is comfortable —
-		// the average-based thermostat won't do this on its own. Owns the setpoint when engaged.
-		guarding := m.handleHeatGuard(haveOut, outdoor, haveUp, upF, haveSet, setpoint)
-
-		// ── solar pre-cool: actuate (or advise) ──────────────────────────────────
-		// Skip while Heat-Guard owns the setpoint (comfort target already below any precool target).
-		if guarding {
-			m.precooling = false
-		} else {
-			m.handlePrecool(mode, haveSet, setpoint, haveCur, current, grid, haveOut, outdoor)
+			// ── free cooling: cooler outside than in → run the attic+box fans, let the AC cycle off.
+			target := 74.0
+			if haveSet {
+				target = setpoint
+			} else if m.haveBase {
+				target = m.baseSet
+			}
+			freeCoolActive := m.handleFreeCool(haveOut, outdoor, haveUp, upF, target)
+			// ── attic fan: experiment until verdict, then auto-run if it helps ────────
+			qualify = m.cfg.AtticExperiment && haveOut && haveUp && outdoor > upF+1 && pv > 200
+			if freeCoolActive {
+				m.arm = "" // free-cool owns the fans; not in an A/B arm
+			} else {
+				m.handleAttic(now, qualify, upF, cooling)
+			}
+			// ── Heat-Guard (disabled via config) + solar pre-cool ─────────────────────
+			guarding := m.handleHeatGuard(haveOut, outdoor, haveUp, upF, haveSet, setpoint)
+			if guarding {
+				m.precooling = false
+			} else {
+				m.handlePrecool(mode, haveSet, setpoint, haveCur, current, grid, haveOut, outdoor)
+			}
 		}
 	}
 
@@ -244,6 +287,9 @@ func (m *Manager) tick(now time.Time) {
 	// ── observability ────────────────────────────────────────────────────────
 	m.publish(now, haveDelta, delta, haveOut, outdoor, upF, qualify,
 		haveUp, feelsUp, upRH, upRHn, haveDown, feelsDown, downRH, downRHn)
+
+	// ── holistic per-room comfort panel (Stage 1: observe only, no actuation) ──
+	m.publishZones(now)
 
 	m.saveState()
 }
@@ -810,8 +856,29 @@ func (m *Manager) publishPrecoolAdvisory(mode string, haveSet bool, setpoint flo
 func (m *Manager) setTemp(v float64) {
 	m.bus.Publish("service.call", map[string]any{
 		"service": "climate.set_temperature", "entity": "climate.house",
-		"data": map[string]any{"temperature": round1(v)},
+		"data":   map[string]any{"temperature": round1(v)},
+		"source": "brain", // so the thermostat/override logic never mistakes our command for the user's
 	})
+}
+
+// logOverride records a manual setpoint override + its context, as a labeled comfort signal the
+// brain can later analyze ("the user set 75 when feels-up was X, outdoor Y, at hour H → learn why").
+func (m *Manager) logOverride(now time.Time, source string, setpoint, feelsUp, feelsDown float64, haveOut bool, outdoor float64) {
+	rec := map[string]any{
+		"ts": now.Format(time.RFC3339), "source": source, "setpoint": round1(setpoint),
+		"feels_up": round1(feelsUp), "feels_down": round1(feelsDown), "hour": now.Hour(),
+	}
+	if haveOut {
+		rec["outdoor"] = round1(outdoor)
+	}
+	f, err := os.OpenFile(overrideFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if b, err := json.Marshal(rec); err == nil {
+		f.Write(append(b, '\n'))
+	}
 }
 
 // ── comfort model ────────────────────────────────────────────────────────────
@@ -929,6 +996,8 @@ func (m *Manager) publish(now time.Time, haveDelta bool, delta float64, haveOut 
 
 	status := "observing"
 	switch {
+	case m.holdStatus != "":
+		status = m.holdStatus // manual-override hold wins
 	case m.freeCooling:
 		status = "FREE-COOLING — fans pulling cool air in, AC idle"
 	case m.arm == "run":

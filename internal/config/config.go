@@ -200,6 +200,16 @@ type ClimateBrainConfig struct {
 	HeatGuardFloor   float64 `yaml:"heat_guard_floor"`   // hard floor — never command below this °F (default 70)
 	HeatGuardMaxDrop float64 `yaml:"heat_guard_max_drop"` // max °F below base the guard will command (default 4)
 
+	// Manual-override hold: when the user sets the setpoint (UI/assistant), the brain + all
+	// controllers hand off for this many minutes before resuming control (default 60).
+	ManualHoldMin float64 `yaml:"manual_hold_min"`
+
+	// ── Holistic per-room comfort: each room is {its own sensor, its own baseline, its own fan}.
+	// Sensor accuracy is irrelevant — each gauge is used RELATIVE to itself (a "just right" tap
+	// pins that room's comfortable reading; the brain moves that gauge with that room's levers,
+	// learning each lever's effect by trial and error). Stage 1 = observe + publish only.
+	Zones []ZoneConfig `yaml:"zones"`
+
 	// ── Unified comfort-at-least-cost policy: ONE objective loop (keep the warm zone under the
 	// comfort ceiling using the cheapest sufficient actuator) that will replace the pile of
 	// individual modes. Runs in SHADOW (advisory, publishes what it WOULD do) until policy_actuate.
@@ -208,6 +218,18 @@ type ClimateBrainConfig struct {
 	PolicyHigh    float64 `yaml:"policy_comfort_high"` // warm-zone comfort ceiling °F (default 78)
 	PolicyLow     float64 `yaml:"policy_comfort_low"`  // cool-zone floor °F (default 68)
 	PolicyTarget  float64 `yaml:"policy_target"`       // active-cooling aim °F (default = base setpoint)
+}
+
+// ZoneConfig = one room in the holistic comfort model. TempSensor is that room's own gauge
+// (used relative to itself, so absolute accuracy doesn't matter); Fan is the room's comfort
+// lever (a number 0..FanMax), empty for AC-only rooms like a hallway.
+type ZoneConfig struct {
+	Name       string `yaml:"name"`        // short room id, e.g. "bedroom2"
+	TempSensor string `yaml:"temp_sensor"` // this room's temperature entity
+	TempIsC    bool   `yaml:"temp_is_c"`   // true if the sensor reports °C (LiquidFW climate probes do)
+	Humidity   string `yaml:"humidity"`    // optional RH entity for a feels-like
+	Fan        string `yaml:"fan"`         // optional ceiling-fan number entity (the room's lever)
+	FanMax     int    `yaml:"fan_max"`     // max fan speed (default 3)
 }
 
 // WeatherConfig = free Open-Meteo outdoor conditions for the climate brain (no API key).

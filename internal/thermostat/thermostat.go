@@ -80,13 +80,21 @@ type Manager struct {
 	circulate bool      // currently requesting blower circulation (destratify)
 	circStart time.Time // when the current circulation run started
 	circStop  time.Time // when the last circulation run ended (for the min-off rest)
+
+	// Provenance of the last setpoint change — who moved it and when. Lets the climate brain
+	// honor a manual (UI/assistant) override for an hour before resuming control, instead of
+	// guessing (which caused wrong "the brain drifted it" calls). Stamped onto climate.house.
+	setpointSource  string    // "user" | "assistant" | "brain" | "" (startup)
+	setpointChanged time.Time // when the setpoint last actually changed
 }
 
 type persistState struct {
-	Mode    string  `json:"mode"`
-	CoolSet float64 `json:"cool_setpoint"`
-	HeatSet float64 `json:"heat_setpoint"`
-	Preset  string  `json:"preset"`
+	Mode            string  `json:"mode"`
+	CoolSet         float64 `json:"cool_setpoint"`
+	HeatSet         float64 `json:"heat_setpoint"`
+	Preset          string  `json:"preset"`
+	SetpointSource  string  `json:"setpoint_source,omitempty"`
+	SetpointChanged int64   `json:"setpoint_changed,omitempty"` // unix seconds
 }
 
 func NewManager(cfg config.ThermostatConfig, store *entity.Store, b *bus.Bus, sender DeviceSender) *Manager {
@@ -137,7 +145,8 @@ func (m *Manager) Run(ctx context.Context) {
 		}
 		svc, _ := p["service"].(string)
 		data, _ := p["data"].(map[string]any)
-		m.handleService(svc, data)
+		source, _ := p["source"].(string)
+		m.handleService(svc, data, source)
 	})
 
 	// Optional presence-driven auto-away.
@@ -297,10 +306,13 @@ func (m *Manager) readEntitySensors() {
 
 // ── control ──────────────────────────────────────────────────────────────────
 
-func (m *Manager) handleService(svc string, data map[string]any) {
+func (m *Manager) handleService(svc string, data map[string]any, source string) {
 	s := svc
 	if i := strings.LastIndex(s, "."); i >= 0 {
 		s = s[i+1:]
+	}
+	if source == "" {
+		source = "user" // service calls without a tag come from the (auth-gated) API = a human
 	}
 	m.mu.Lock()
 	changed := true
@@ -313,10 +325,18 @@ func (m *Manager) handleService(svc string, data map[string]any) {
 		if v, ok := toFloat(data["temperature"]); ok {
 			m.presetNm = "none"
 			v = clamp(v, m.minT, m.maxT)
+			cur := m.coolSet
 			if m.mode == "heat" {
+				cur = m.heatSet
 				m.heatSet = v
 			} else {
 				m.coolSet = v
+			}
+			// Record provenance only on a real change, so re-sending the same value doesn't
+			// keep resetting the manual-override clock.
+			if v != cur {
+				m.setpointSource = source
+				m.setpointChanged = time.Now()
 			}
 		}
 	case "set_preset_mode":
@@ -415,6 +435,7 @@ func (m *Manager) publishEntity() {
 	temp, haveTemp := m.avgTempFLocked()
 	delta, haveDelta := m.deltaFLocked()
 	circ := m.circulate
+	spSource, spChanged := m.setpointSource, m.setpointChanged
 	perSensor := map[string]any{}
 	for key, r := range m.temps {
 		if r.fresh() {
@@ -450,6 +471,13 @@ func (m *Manager) publishEntity() {
 		"temp_sensors":   perSensor,
 		"temp_available": haveTemp,
 		"circulating":    circ,
+	}
+	// Setpoint provenance (who last moved it + when) so the climate brain can honor a manual override.
+	if spSource != "" {
+		attrs["setpoint_source"] = spSource
+	}
+	if !spChanged.IsZero() {
+		attrs["setpoint_changed"] = spChanged.Unix()
 	}
 	if haveTemp {
 		attrs["current_temperature"] = round1(temp)
@@ -584,7 +612,11 @@ func (m *Manager) stateFile() string {
 
 func (m *Manager) persist() {
 	m.mu.Lock()
-	ps := persistState{Mode: m.mode, CoolSet: m.coolSet, HeatSet: m.heatSet, Preset: m.presetNm}
+	ps := persistState{Mode: m.mode, CoolSet: m.coolSet, HeatSet: m.heatSet, Preset: m.presetNm,
+		SetpointSource: m.setpointSource}
+	if !m.setpointChanged.IsZero() {
+		ps.SetpointChanged = m.setpointChanged.Unix()
+	}
 	m.mu.Unlock()
 	data, _ := json.MarshalIndent(ps, "", "  ")
 	if err := os.WriteFile(m.stateFile(), data, 0644); err != nil {
@@ -612,6 +644,12 @@ func (m *Manager) load() {
 	}
 	if ps.Preset != "" {
 		m.presetNm = ps.Preset
+	}
+	if ps.SetpointSource != "" {
+		m.setpointSource = ps.SetpointSource
+	}
+	if ps.SetpointChanged != 0 {
+		m.setpointChanged = time.Unix(ps.SetpointChanged, 0)
 	}
 	slog.Info("thermostat: restored state", "mode", m.mode, "cool", m.coolSet, "heat", m.heatSet, "preset", m.presetNm)
 }

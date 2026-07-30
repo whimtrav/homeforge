@@ -333,7 +333,7 @@ func (s *Server) execTool(name string, args map[string]any) string {
 		return 0, false
 	}
 	call := func(service, entity string, data map[string]any) {
-		s.bus.Publish("service.call", map[string]any{"service": service, "entity": entity, "data": data})
+		s.bus.Publish("service.call", map[string]any{"service": service, "entity": entity, "data": data, "source": "assistant"})
 	}
 
 	switch name {
