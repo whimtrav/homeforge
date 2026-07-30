@@ -345,6 +345,8 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/automations/{name}/enabled", s.handleAutomationEnabled)
 	mux.HandleFunc("GET /api/floorplan", s.handleFloorplanGet)
 	mux.HandleFunc("PUT /api/floorplan", s.handleFloorplanPut)
+	mux.HandleFunc("GET /api/floorplan/vents", s.handleVentsGet)
+	mux.HandleFunc("PUT /api/floorplan/vents", s.handleVentsPut)
 	mux.HandleFunc("GET /api/history/{id}", s.handleHistory)
 	mux.HandleFunc("GET /api/water/usage", s.handleWaterUsage)
 	mux.HandleFunc("POST /api/scale/{device}", s.handleScale)

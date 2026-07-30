@@ -14,6 +14,11 @@
   let svgEl: SVGSVGElement
   let trayEl: HTMLElement
 
+  // HVAC vents (supply/return registers) — stored separately from device pins.
+  type Vent = { id: string; type: 'supply' | 'return'; x: number; y: number; m: string }
+  let vents = $state<Vent[]>([])
+  let ventDrag = $state<{ id: string } | null>(null)
+
   // Rooms — the floor plan we built (1 ft = 24 px, origin = back-left, px 40,60)
   const REF = [
     { n: 'Bedroom 1', x: 40, y: 60, w: 294, h: 256, c: '#dbeafe' },
@@ -89,6 +94,10 @@
       .then((r) => r.json())
       .then((p) => (positions = p || {}))
       .catch(() => {})
+    fetch('/api/floorplan/vents')
+      .then((r) => r.json())
+      .then((v) => (vents = Array.isArray(v) ? v : []))
+      .catch(() => {})
     return connectWS((msg: WSMessage) => {
       connected = true
       if (msg.type === 'snapshot' && msg.entities) entities = msg.entities
@@ -120,6 +129,11 @@
     drag = { key, mode: 'move' }
   }
   function onMove(e: PointerEvent) {
+    if (ventDrag) {
+      const s = toSvg(e.clientX, e.clientY)
+      vents = vents.map((v) => (v.id === ventDrag!.id ? { ...v, x: clamp(s.x, 20, 1180), y: clamp(s.y, 74, 700) } : v))
+      return
+    }
     if (!drag) return
     if (drag.mode === 'new') {
       if (ghost) ghost = { ...ghost, x: e.clientX, y: e.clientY }
@@ -129,6 +143,11 @@
     }
   }
   function onUp(e: PointerEvent) {
+    if (ventDrag) {
+      saveVents()
+      ventDrag = null
+      return
+    }
     if (!drag) return
     const tr = trayEl.getBoundingClientRect()
     const sv = svgEl.getBoundingClientRect()
@@ -166,6 +185,41 @@
       save()
     }
   }
+
+  // ── HVAC vents ────────────────────────────────────────────────────────────
+  let ventSaveT: any
+  function saveVents() {
+    savedMsg = 'saving…'
+    clearTimeout(ventSaveT)
+    ventSaveT = setTimeout(async () => {
+      try {
+        await fetch('/api/floorplan/vents', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(vents) })
+        savedMsg = '✓ saved'
+      } catch {
+        savedMsg = 'save failed'
+      }
+    }, 350)
+  }
+  function addVent(type: 'supply' | 'return') {
+    const id = type[0] + '-' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36)
+    // stagger new ones near the top-left so they don't stack exactly
+    const n = vents.length
+    vents = [...vents, { id, type, x: 70 + (n % 8) * 30, y: 90 + Math.floor(n / 8) * 46, m: '' }]
+    saveVents()
+  }
+  function startVentMove(e: PointerEvent, id: string) {
+    e.preventDefault()
+    e.stopPropagation()
+    ventDrag = { id }
+  }
+  function setVentM(id: string, m: string) {
+    vents = vents.map((v) => (v.id === id ? { ...v, m } : v))
+    saveVents()
+  }
+  function delVent(id: string) {
+    vents = vents.filter((v) => v.id !== id)
+    saveVents()
+  }
   const pinColor = (d: Dev) => (d.on ? 'var(--accent)' : '#8b93a1')
   const labW = (name: string) => Math.max(46, name.length * 6.4)
 </script>
@@ -191,6 +245,8 @@
     <div class="fp-bar">
       <span class="fp-conn"><span class="fp-dot" class:live={connected}></span>{connected ? devices.length + ' devices live' : 'connecting…'}</span>
       <span class="fp-saved">{savedMsg}</span>
+      <button class="fp-add sup" onclick={() => addVent('supply')}>＋ Supply</button>
+      <button class="fp-add ret" onclick={() => addVent('return')}>＋ Return</button>
       <button class="fp-clear" onclick={clearAll}>Clear pins</button>
     </div>
     <svg bind:this={svgEl} viewBox="0 0 1200 720" class="fp-svg">
@@ -212,6 +268,21 @@
           {/if}
           <title>{d.name}{d.det ? ' — ' + d.det : ''}</title>
         </g>
+      {/each}
+      {#each vents as v (v.id)}
+        <foreignObject x={v.x - 27} y={v.y - 21} width="54" height="42" style="overflow: visible">
+          <div class="vent {v.type}" xmlns="http://www.w3.org/1999/xhtml" onpointerdown={(e) => startVentMove(e, v.id)}>
+            <button class="vent-x" onpointerdown={(e) => { e.stopPropagation(); delVent(v.id) }} title="remove vent">×</button>
+            <div class="vent-hd">{v.type === 'supply' ? '⬇ SUP' : '⬆ RET'}</div>
+            <input
+              class="vent-m"
+              value={v.m}
+              placeholder="—"
+              onpointerdown={(e) => e.stopPropagation()}
+              oninput={(e) => setVentM(v.id, (e.currentTarget as HTMLInputElement).value)}
+            />
+          </div>
+        </foreignObject>
       {/each}
     </svg>
   </div>
@@ -237,8 +308,21 @@
   .fp-conn { display: flex; align-items: center; gap: 6px; }
   .fp-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
   .fp-dot.live { background: var(--success); box-shadow: 0 0 8px var(--success); }
+  .fp-add { margin-left: 4px; border: 1px solid var(--border); border-radius: 7px; padding: 6px 11px; font-size: 12px; font-weight: 700; cursor: pointer; }
+  .fp-add.sup { background: #dbeafe; color: #1e3a8a; border-color: #3b82f6; }
+  .fp-add.ret { background: #fef3c7; color: #92400e; border-color: #f59e0b; }
+  .fp-add:hover { filter: brightness(0.96); }
   .fp-clear { margin-left: auto; background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 7px; padding: 6px 11px; font-size: 12px; cursor: pointer; }
   .fp-clear:hover { border-color: var(--accent); }
+  /* HVAC vents */
+  .vent { position: relative; width: 54px; box-sizing: border-box; border-radius: 7px; border: 1.5px solid; padding: 2px 3px 3px; text-align: center; cursor: grab; user-select: none; touch-action: none; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3); font-family: Inter, system-ui, sans-serif; }
+  .vent:active { cursor: grabbing; }
+  .vent.supply { background: #dbeafe; border-color: #3b82f6; color: #1e3a8a; }
+  .vent.return { background: #fef3c7; border-color: #f59e0b; color: #92400e; }
+  .vent-hd { font-size: 8px; font-weight: 800; letter-spacing: 0.3px; line-height: 1.15; }
+  .vent-m { width: 100%; box-sizing: border-box; border: none; border-radius: 4px; text-align: center; font-size: 11px; font-weight: 700; padding: 1px 0; margin-top: 1px; background: rgba(255, 255, 255, 0.9); color: #111; }
+  .vent-m:focus { outline: 2px solid currentColor; }
+  .vent-x { position: absolute; top: -7px; right: -7px; width: 15px; height: 15px; border-radius: 50%; border: none; background: #ef4444; color: #fff; font-size: 11px; line-height: 15px; text-align: center; cursor: pointer; padding: 0; }
   .fp-svg { background: #fbfbfc; border-radius: 10px; flex: 1; min-height: 0; width: 100%; touch-action: none; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25); }
   .fp-pin { cursor: grab; }
   .fp-pin:active { cursor: grabbing; }
