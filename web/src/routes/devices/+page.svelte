@@ -8,10 +8,11 @@
   let connected = $state(false)
   let search = $state('')
   let openKey = $state<string | null>(null)   // device open in the modal
+  let now = $state(Date.now())                 // ticks so online() re-derives against a fresh clock
 
   onMount(() => {
     fetch('/api/floorplan').then(r => r.json()).then(d => { pins = d || {} }).catch(() => {})
-    return connectWS((msg: WSMessage) => {
+    const off = connectWS((msg: WSMessage) => {
       connected = true
       if (msg.type === 'snapshot' && msg.entities) {
         const m = new Map<string, Entity>()
@@ -23,6 +24,8 @@
         entities = m
       }
     })
+    const tick = setInterval(() => (now = Date.now()), 5000)
+    return () => { off(); clearInterval(tick) }
   })
 
   // Rooms = the non-structural rectangles from the floor plan (viewBox 1200x720).
@@ -149,6 +152,25 @@
   function switches(d: Dev) { return d.entities.filter(e => CONTROL.has(e.domain)) }
   function anyOn(d: Dev) { return switches(d).some(isOn) }
 
+  // --- online status ---
+  // A LiquidFW device emits sensor.<slug>_uptime on every ~5s broadcast; its value ticks
+  // each time, so the WS pushes a state_changed every ~5s and its last_updated stays fresh
+  // while the device is alive. That is a reliable per-device heartbeat.
+  const STALE_MS = 120_000
+  function heartbeat(d: Dev): Entity | undefined {
+    return d.entities.find(e => e.id.endsWith('_uptime'))
+  }
+  // Trust the heartbeat's freshness when the device has one. Devices with no heartbeat
+  // (WiZ/WLED/cloud/MQTT-event) can't be judged this way, so assume online rather than
+  // false-flag them offline.
+  function online(d: Dev): boolean {
+    const hb = heartbeat(d)
+    if (!hb) return true
+    const t = Date.parse(hb.last_updated)
+    if (!t) return true
+    return now - t < STALE_MS
+  }
+
   // Device-type icon — shared classifier in $lib/api (keeps Devices + Floor Plan in sync).
   const devIcon = (d: Dev): string => deviceIcon(d.name, d.entities)
 
@@ -183,8 +205,31 @@
     await callService(e.domain, 'set_value', e.id, { value })
   }
 
+  // --- device maintenance (LiquidFW): reboot + OTA-prep ---
+  let maintBusy = $state(false)
+  let maintMsg = $state('')
+  async function rebootDevice(name: string) {
+    if (!confirm(`Reboot ${name}?`)) return
+    maintBusy = true; maintMsg = 'rebooting…'
+    try {
+      const r = await fetch(`/api/devices/${encodeURIComponent(name)}/restart`, { method: 'POST' })
+      maintMsg = r.ok ? 'reboot sent ✓' : `failed: ${(await r.text()).slice(0, 60)}`
+    } catch { maintMsg = 'failed' }
+    maintBusy = false
+  }
+  async function otaPrepDevice(name: string) {
+    if (!confirm(`Put ${name} in OTA-prep mode? Loads turn OFF and it suspends heavy work (BLE scan) for ~5 min so it can be flashed without starving the OTA.`)) return
+    maintBusy = true; maintMsg = 'prepping…'
+    try {
+      const r = await fetch(`/api/devices/${encodeURIComponent(name)}/ota_prep`, { method: 'POST' })
+      maintMsg = r.ok ? 'OTA-prep ON (~5 min) ✓' : `failed: ${(await r.text()).slice(0, 60)}`
+    } catch { maintMsg = 'failed' }
+    maintBusy = false
+  }
+
   let openDev = $derived(openKey ? (devices.find(d => d.key === openKey) ?? null) : null)
   let deviceCount = $derived(devices.length)
+  let offlineCount = $derived(devices.filter(d => !online(d)).length)
 </script>
 
 <div class="max-w-7xl mx-auto">
@@ -193,7 +238,7 @@
       <h1 class="text-xl font-semibold" style="color: var(--text)">Devices</h1>
       <p class="text-sm mt-0.5" style="color: var(--text-muted)">
         <span class="inline-block w-2 h-2 rounded-full mr-1 align-middle" style="background:{connected ? 'var(--success)' : 'var(--danger)'}"></span>
-        {deviceCount} devices &middot; grouped by room (floor plan)
+        {deviceCount} devices{#if offlineCount > 0} &middot; <span style="color: var(--danger)">{offlineCount} offline</span>{/if} &middot; grouped by room (floor plan)
       </p>
     </div>
     <input type="text" placeholder="Search…" bind:value={search}
@@ -211,12 +256,17 @@
       <div class="dev-grid">
         {#each section.devs as dev (dev.key)}
           <div class="dev-box group" role="button" tabindex="0"
+            class:offline={!online(dev)}
             style="border-color: {anyOn(dev) ? 'var(--accent)' : 'var(--border)'}"
             onclick={() => openKey = dev.key}
             onkeydown={(e) => { if (e.key === 'Enter') openKey = dev.key }}>
             <div class="flex items-center gap-2">
               <span class="text-lg leading-none">{devIcon(dev)}</span>
-              <span class="w-2 h-2 rounded-full ml-auto flex-shrink-0" style="background: {anyOn(dev) ? 'var(--success)' : 'var(--surface-3)'}"></span>
+              <span class="dots ml-auto flex-shrink-0">
+                <span class="dot" title={online(dev) ? 'online' : 'offline'}
+                  style="background: {online(dev) ? 'var(--success)' : 'var(--danger)'}"></span>
+                {#if anyOn(dev)}<span class="dot" title="on (switch)" style="background: #3b82f6"></span>{/if}
+              </span>
             </div>
             <div class="text-sm font-semibold mt-2 truncate" style="color: var(--text)" title={dev.name}>{dev.name}</div>
             <div class="text-xs mt-0.5 truncate" style="color: var(--text-muted)">{summary(dev)}</div>
@@ -251,6 +301,9 @@
       <div class="flex items-center gap-2 mb-3">
         <span class="text-xl">{devIcon(openDev)}</span>
         <span class="text-base font-semibold" style="color: var(--text)">{openDev.name}</span>
+        <span class="dot" title={online(openDev) ? 'online' : 'offline'}
+          style="background: {online(openDev) ? 'var(--success)' : 'var(--danger)'}"></span>
+        <span class="text-xs" style="color: var(--text-muted)">{online(openDev) ? 'online' : 'offline'}</span>
         <button class="ml-auto text-lg px-2 leading-none" style="color: var(--text-muted)" onclick={() => openKey = null}>✕</button>
       </div>
 
@@ -297,6 +350,19 @@
           </div>
         {/each}
       {/if}
+
+      {#if heartbeat(openDev)}
+        <div class="text-xs uppercase tracking-wide mt-3 mb-1.5" style="color: var(--text-muted)">Maintenance</div>
+        <div class="flex items-center gap-2 flex-wrap">
+          <button onclick={() => rebootDevice(openDev.name)} disabled={maintBusy}
+            class="text-xs px-3 py-1.5 rounded-md"
+            style="background: var(--surface-3); color: var(--text); border: 1px solid var(--border)">↻ Reboot</button>
+          <button onclick={() => otaPrepDevice(openDev.name)} disabled={maintBusy}
+            class="text-xs px-3 py-1.5 rounded-md"
+            style="background: var(--surface-3); color: var(--text); border: 1px solid var(--border)">⬆ Prep OTA</button>
+          {#if maintMsg}<span class="text-xs" style="color: var(--text-muted)">{maintMsg}</span>{/if}
+        </div>
+      {/if}
     </div>
   </div>
 {/if}
@@ -321,6 +387,9 @@
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
     z-index: 20;
   }
+  .dev-box.offline { opacity: 0.55; }
+  .dots { display: inline-flex; align-items: center; gap: 4px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
   .glance {
     position: absolute;
     top: calc(100% + 6px);

@@ -33,6 +33,11 @@ HS_PASS = os.environ.get("HS_PASSWORD", "").strip()
 HS_TOKEN = os.environ.get("HS_TOKEN", "").strip() or None
 HS_CLIENT = os.environ.get("HS_CLIENT", "hubspace").strip()
 
+# Local slug overrides for Hubspace cloud device names that are wrong/confusing.
+RENAME = {
+    "gar_car": "office_ceiling",  # single ceiling light in the downstairs office
+}
+
 
 def slug(s: str) -> str:
     out, prev = [], False
@@ -69,7 +74,7 @@ class Bridge:
         n = 0
         # --- switches (outlets, possibly multi-instance) ---
         for r in self.api.switches:
-            base = slug(dev_name(r))
+            base = RENAME.get(slug(dev_name(r)), slug(dev_name(r)))
             try:
                 on_map = r.on  # dict instance -> feature
             except Exception:
@@ -87,7 +92,7 @@ class Bridge:
                 n += 1
         # --- lights (some Hubspace "lights" are dimmable plugs) ---
         for r in self.api.lights:
-            s = slug(dev_name(r))
+            s = RENAME.get(slug(dev_name(r)), slug(dev_name(r)))
             self.pub(s, "power", "on" if getattr(r, "is_on", False) else "off")
             if getattr(r, "supports_dimming", False) or getattr(r, "dimming", None):
                 b = getattr(r, "brightness", None)
@@ -97,7 +102,7 @@ class Bridge:
             n += 1
         # --- fans ---
         for r in self.api.fans:
-            s = slug(dev_name(r))
+            s = RENAME.get(slug(dev_name(r)), slug(dev_name(r)))
             self.pub(s, "power", "on" if getattr(r, "is_on", False) else "off")
             if getattr(r, "supports_speed", False):
                 sp = getattr(getattr(r, "speed", None), "speed", None)
@@ -113,6 +118,15 @@ class Bridge:
         if not target:
             log.warning("set for unknown device %s", dev)
             return
+        # Optimistic state echo: publish the commanded value to MQTT immediately so HF (and Alexa's
+        # post-command ReportState) reflect it within ~1s instead of waiting for the 30s poll. Without
+        # this the state stays stale after a toggle and Alexa greys the tile as "unconfirmed". The
+        # next poll corrects it if the set actually failed.
+        if "power" in payload:
+            self.pub(dev, "power", "on" if str(payload["power"]).lower() in ("on", "true", "1") else "off")
+        elif "brightness" in payload:
+            self.pub(dev, "brightness", int(float(payload["brightness"])))
+            self.pub(dev, "power", "on")  # brightness implies the load is on
         kind, rid, inst = target["kind"], target["rid"], target["instance"]
         try:
             if kind == "switch":
@@ -140,6 +154,27 @@ class Bridge:
             log.warning("set %s failed: %s: %s", dev, type(e).__name__, e)
 
 
+TOKEN_FILE = "/data/hubspace-refresh-token"
+
+
+def _load_token():
+    try:
+        with open(TOKEN_FILE) as f:
+            return f.read().strip() or None
+    except Exception:
+        return None
+
+
+def _save_token(t):
+    if not t:
+        return
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            f.write(t)
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not persist refresh token: %s", e)
+
+
 async def main():
     if not (HS_USER and HS_PASS):
         log.error("HS_USERNAME + HS_PASSWORD required")
@@ -147,6 +182,15 @@ async def main():
 
     m = mqtt.Client()
     m.username_pw_set(MQTT_USER, MQTT_PASS)
+
+    def _on_connect(_c, _u, _flags, _rc):
+        # Re-subscribe on EVERY (re)connect. paho drops subscriptions across an auto-reconnect,
+        # so without this the bridge keeps publishing state but goes deaf to hubspace/+/set
+        # commands after the first broker blip -> control silently dies until a restart.
+        _c.subscribe("hubspace/+/set")
+        log.info("(re)subscribed hubspace/+/set (rc=%s)", _rc)
+
+    m.on_connect = _on_connect
     m.connect(MQTT_HOST, MQTT_PORT, 60)
     m.loop_start()
     log.info("MQTT -> %s:%s", MQTT_HOST, MQTT_PORT)
@@ -154,12 +198,17 @@ async def main():
     loop = asyncio.get_running_loop()
 
     async with aiohttp.ClientSession() as session:
+        # Prefer a persisted refresh token (survives restarts silently) over a cold password login.
+        _last_token = _load_token() or HS_TOKEN
         api = AferoBridgeV1(
-            HS_USER, HS_PASS, refresh_token=HS_TOKEN, session=session,
+            HS_USER, HS_PASS, refresh_token=_last_token, session=session,
             polling_interval=POLL, afero_client=HS_CLIENT,
         )
         await api.initialize()
         await api.async_block_until_done()
+        if api.refresh_token and api.refresh_token != _last_token:
+            _save_token(api.refresh_token)
+            _last_token = api.refresh_token
         log.info("connected; lights=%d switches=%d fans=%d",
                  len(list(api.lights)), len(list(api.switches)), len(list(api.fans)))
 
@@ -182,6 +231,9 @@ async def main():
             try:
                 count = bridge.publish_all()
                 log.info("published %d devices", count)
+                if api.refresh_token and api.refresh_token != _last_token:
+                    _save_token(api.refresh_token)
+                    _last_token = api.refresh_token
             except Exception as e:  # noqa: BLE001
                 log.warning("publish error: %s: %s", type(e).__name__, e)
             await asyncio.sleep(POLL)

@@ -6,6 +6,21 @@
   let disconnect: (() => void) | null = null
   let usage = $state<{ hour: number; today: number; week: number; month: number } | null>(null)
   let usageTimer: ReturnType<typeof setInterval> | null = null
+  let cycle = $state<any>(null)
+  let cycleTimer: ReturnType<typeof setInterval> | null = null
+  let showBillForm = $state(false)
+  let billReadTo = $state('')
+  let billBank = $state('')
+  let billMsg = $state('')
+  async function loadCycle() {
+    try { const r = await fetch('/api/energy/cycle'); if (r.ok) cycle = await r.json() } catch {}
+  }
+  async function rectifyBill() {
+    billMsg = ''
+    if (!billReadTo) { billMsg = 'Enter the read date'; return }
+    const r = await fetch('/api/energy/cycle/rectify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ read_to: billReadTo, bank_kwh: parseFloat(billBank) || 0 }) })
+    if (r.ok) { billMsg = 'Logged'; showBillForm = false; billReadTo = ''; billBank = ''; await loadCycle() } else billMsg = 'Failed'
+  }
 
   onMount(async () => {
     for (const e of await fetchEntities()) ents[e.id] = e
@@ -27,10 +42,13 @@
     }
     loadUsage()
     usageTimer = setInterval(loadUsage, 30000)
+    loadCycle()
+    cycleTimer = setInterval(loadCycle, 60000)
   })
   onDestroy(() => {
     disconnect?.()
     if (usageTimer) clearInterval(usageTimer)
+    if (cycleTimer) clearInterval(cycleTimer)
   })
 
   // solar sensor value (number) by metric name, or null if missing
@@ -142,6 +160,43 @@
 
 <div class="max-w-5xl mx-auto flex flex-col gap-6">
   <h1 class="text-xl font-bold" style="color: var(--text)">Energy</h1>
+  {#if cycle}
+  <section>
+    <div class="rounded-xl p-4 border" style="border-color: {cycle.needs_bill ? 'var(--accent)' : 'var(--border)'}; background: var(--surface)">
+      <div class="flex items-center justify-between flex-wrap gap-2">
+        <h2 class="text-sm font-semibold uppercase tracking-wide" style="color: var(--text-muted)">Billing Cycle</h2>
+        <div class="text-xs" style="color: var(--text-muted)">since {cycle.cycle_start} · day {cycle.day} of ~{cycle.expected_days}</div>
+      </div>
+      <div class="grid gap-3 mt-3" style="grid-template-columns: repeat(auto-fit, minmax(105px, 1fr))">
+        <div><div class="text-xl font-bold" style="color: var(--text)">{cycle.grid_import}</div><div class="text-xs" style="color: var(--text-muted)">Import kWh</div></div>
+        <div><div class="text-xl font-bold" style="color: var(--text)">{cycle.grid_export}</div><div class="text-xs" style="color: var(--text-muted)">Export kWh</div></div>
+        <div><div class="text-xl font-bold" style="color: {cycle.grid_net > 0 ? '#e06a5c' : '#4ea172'}">{cycle.grid_net > 0 ? '+' : ''}{cycle.grid_net}</div><div class="text-xs" style="color: var(--text-muted)">Net {cycle.grid_net > 0 ? '(import)' : '(banked)'}</div></div>
+        <div><div class="text-xl font-bold" style="color: var(--text)">{cycle.generation}</div><div class="text-xs" style="color: var(--text-muted)">Generated</div></div>
+        <div><div class="text-xl font-bold" style="color: var(--text)">{cycle.consumption}</div><div class="text-xs" style="color: var(--text-muted)">Used</div></div>
+        <div><div class="text-xl font-bold" style="color: var(--accent)">{cycle.bank_kwh}</div><div class="text-xs" style="color: var(--text-muted)">Credit bank{cycle.bank_delta ? ' ' + (cycle.bank_delta > 0 ? '+' : '') + cycle.bank_delta : ''}</div></div>
+      </div>
+      {#if cycle.needs_bill || showBillForm}
+      <div class="mt-3 pt-3 border-t" style="border-color: var(--border)">
+        {#if cycle.needs_bill && !showBillForm}
+          <div class="flex items-center justify-between flex-wrap gap-2">
+            <span class="text-sm" style="color: var(--accent)">New bill likely ready — log it to rectify the cycle</span>
+            <button class="text-sm px-3 py-1 rounded-lg" style="background: var(--accent); color: #fff" onclick={() => showBillForm = true}>Log bill</button>
+          </div>
+        {/if}
+        {#if showBillForm}
+          <div class="flex items-end gap-2 flex-wrap">
+            <label class="text-xs" style="color: var(--text-muted)">Read date<br /><input type="date" bind:value={billReadTo} class="mt-1 px-2 py-1 rounded border" style="background: var(--surface); color: var(--text); border-color: var(--border)" /></label>
+            <label class="text-xs" style="color: var(--text-muted)">Bank kWh<br /><input type="number" bind:value={billBank} placeholder="2020" class="mt-1 px-2 py-1 rounded border w-24" style="background: var(--surface); color: var(--text); border-color: var(--border)" /></label>
+            <button class="text-sm px-3 py-1 rounded-lg" style="background: var(--accent); color: #fff" onclick={rectifyBill}>Save</button>
+            <button class="text-sm px-3 py-1 rounded-lg border" style="border-color: var(--border); color: var(--text-muted)" onclick={() => showBillForm = false}>Cancel</button>
+            {#if billMsg}<span class="text-xs" style="color: var(--text-muted)">{billMsg}</span>{/if}
+          </div>
+        {/if}
+      </div>
+      {/if}
+    </div>
+  </section>
+  {/if}
 
   <!-- ── Big Appliances (the 5 that matter) — DualR3 meters + Emporia CTs ── -->
   <section>

@@ -16,14 +16,17 @@ type Engine struct {
 	store       *entity.Store
 	bus         *bus.Bus
 	state       *StateStore // per-automation enabled/disabled overrides (nil = all enabled)
+	lat, lon    float64     // site location for sun (sunrise/sunset) triggers
 }
 
-func NewEngine(automations []config.AutomationConfig, store *entity.Store, b *bus.Bus, state *StateStore) *Engine {
+func NewEngine(automations []config.AutomationConfig, store *entity.Store, b *bus.Bus, state *StateStore, lat, lon float64) *Engine {
 	return &Engine{
 		automations: automations,
 		store:       store,
 		bus:         b,
 		state:       state,
+		lat:         lat,
+		lon:         lon,
 	}
 }
 
@@ -52,7 +55,68 @@ func (e *Engine) Run(ctx context.Context) {
 		}
 	})
 
+	// Sun (sunrise/sunset) triggers run on a time ticker, not on state changes.
+	go e.runSunTriggers(ctx)
+
 	<-ctx.Done()
+}
+
+// runSunTriggers fires automations whose trigger.type == "sun" at the day's
+// sunrise/sunset (± offset minutes), once per day each. A 30s ticker recomputes
+// the sun times and fires on the first tick at/after the target; a target missed
+// by >10 min (e.g. HF started well after it) is marked done, not fired stale.
+func (e *Engine) runSunTriggers(ctx context.Context) {
+	hasSun := false
+	for _, a := range e.automations {
+		if a.Trigger.Type == "sun" {
+			hasSun = true
+			break
+		}
+	}
+	if !hasSun {
+		return
+	}
+	fired := map[string]string{} // automation name -> yyyy-mm-dd last fired
+	tk := time.NewTicker(30 * time.Second)
+	defer tk.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tk.C:
+			now := time.Now()
+			today := now.Format("2006-01-02")
+			sunrise, sunset := SunTimes(e.lat, e.lon, now)
+			for _, a := range e.automations {
+				if a.Trigger.Type != "sun" || !e.state.Enabled(a.Name) {
+					continue
+				}
+				var target time.Time
+				switch a.Trigger.Event {
+				case "sunset":
+					target = sunset
+				case "sunrise":
+					target = sunrise
+				default:
+					continue
+				}
+				target = target.Add(time.Duration(a.Trigger.Offset) * time.Minute)
+				if fired[a.Name] == today || now.Before(target) {
+					continue
+				}
+				if now.Sub(target) > 10*time.Minute { // stale (e.g. startup long after) — skip
+					fired[a.Name] = today
+					continue
+				}
+				fired[a.Name] = today
+				if !e.checkCondition(a.Condition) {
+					continue
+				}
+				slog.Info("automation triggered (sun)", "name", a.Name, "event", a.Trigger.Event, "target", target.Format("15:04"))
+				go e.runActions(ctx, a.Action)
+			}
+		}
+	}
 }
 
 // triggerFires decides whether an incoming state change matches a trigger.

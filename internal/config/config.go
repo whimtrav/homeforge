@@ -105,6 +105,8 @@ type TriggerConfig struct {
 	Topic  string   `yaml:"topic,omitempty"`
 	Above  *float64 `yaml:"above,omitempty"` // numeric trigger: fire on cross up through this value
 	Below  *float64 `yaml:"below,omitempty"` // numeric trigger: fire on cross down through this value
+	Event  string   `yaml:"event,omitempty"`  // sun trigger: "sunrise" | "sunset"
+	Offset int      `yaml:"offset,omitempty"` // sun trigger: minutes relative to the event (+after, -before)
 }
 
 type ConditionConfig struct {
@@ -140,6 +142,28 @@ type IntegrationsConfig struct {
 	Weather      WeatherConfig      `yaml:"weather"`
 	ClimateBrain ClimateBrainConfig `yaml:"climate_brain"`
 	Rachio       RachioConfig       `yaml:"rachio"`
+	Alexa        AlexaConfig        `yaml:"alexa"`
+}
+
+// AlexaConfig = native Alexa Smart Home skill support. HF exposes the curated
+// Devices as Alexa endpoints and handles Smart Home directives. SharedToken
+// authenticates the Lambda->HF hop (same pattern as the media skill).
+type AlexaConfig struct {
+	Enabled           bool          `yaml:"enabled"`
+	SharedToken       string        `yaml:"shared_token"`
+	OAuthClientID     string        `yaml:"oauth_client_id"`
+	OAuthClientSecret string        `yaml:"oauth_client_secret"`
+	EventClientID     string        `yaml:"event_client_id"`     // "Send Alexa Events" (Skill Messaging) creds
+	EventClientSecret string        `yaml:"event_client_secret"` // for the Alexa event gateway (proactive reports)
+	Devices           []AlexaDevice `yaml:"devices"`
+}
+
+// AlexaDevice = one exposed endpoint. Category defaults to LIGHT (FAN for *_fan);
+// BrightnessController is auto-added when a number.<base>_brightness entity exists.
+type AlexaDevice struct {
+	Entity   string `yaml:"entity"`
+	Name     string `yaml:"name"`
+	Category string `yaml:"category,omitempty"`
 }
 
 // RachioConfig = Rachio smart irrigation via its public REST API (bearer api_key,
@@ -165,6 +189,8 @@ type ClimateBrainConfig struct {
 	PrecoolActuate bool    `yaml:"precool_actuate"`     // nudge the cool setpoint DOWN to bank solar coolth
 	PrecoolOffset  float64 `yaml:"precool_offset"`      // max °F below the base setpoint (default 3)
 	PrecoolExportW float64 `yaml:"precool_export_w"`    // min solar export in W to trigger (default 400)
+	PrecoolExportOffW  float64 `yaml:"precool_export_off_w"`  // hysteresis: only DISENGAGE below this export W (default exportW/3) — stops cloud flip-flop
+	PrecoolMinDwellMin float64 `yaml:"precool_min_dwell_min"` // once pre-cooling, HOLD at least this many minutes (default 20)
 	PrecoolMaxOut  float64 `yaml:"precool_max_outdoor"` // above this °F outdoor the AC is too inefficient (default 92)
 	PrecoolMinF    float64 `yaml:"precool_min_f"`       // hard floor °F — never pre-cool below (default 68)
 	AtticAutoRun   bool    `yaml:"attic_auto_run"`      // once A/B says the fan helps, run it during hot+sun
@@ -253,7 +279,7 @@ type DisaggConfig struct {
 type ThermostatConfig struct {
 	Enabled         bool               `yaml:"enabled"`
 	Device          string             `yaml:"device"`    // LiquidFW device name (e.g. climate-control)
-	MQTTHost        string             `yaml:"mqtt_host"` // broker carrying the temp topics (HA: 192.168.1.10)
+	MQTTHost        string             `yaml:"mqtt_host"` // broker carrying the temp topics (e.g. 10.0.0.5)
 	MQTTPort        int                `yaml:"mqtt_port"` // default 1883
 	MQTTUser        string             `yaml:"mqtt_user"`
 	MQTTPass        string             `yaml:"mqtt_pass"`

@@ -324,6 +324,44 @@ func (h *History) IntegrateFlow(ctx context.Context, eid string, start, end time
 	return total, nil
 }
 
+// CycleTotal sums the POSITIVE deltas of a monotonic (total_increasing) counter over
+// [start,end], ignoring resets — a drop = counter/inverter reset, not real usage. This is
+// how a utility_meter derives per-cycle usage from a cumulative kWh counter.
+func (h *History) CycleTotal(ctx context.Context, eid string, start, end time.Time) (float64, error) {
+	var prev float64
+	havePrev := false
+	var cts time.Time
+	err := h.pool.QueryRow(ctx,
+		`SELECT ts, value FROM states WHERE entity_id=$1 AND ts<=$2 AND value IS NOT NULL ORDER BY ts DESC LIMIT 1`,
+		eid, start).Scan(&cts, &prev)
+	if err == nil {
+		havePrev = true
+	} else if err != pgx.ErrNoRows {
+		return 0, err
+	}
+	rows, err := h.pool.Query(ctx,
+		`SELECT value FROM states WHERE entity_id=$1 AND ts>$2 AND ts<=$3 AND value IS NOT NULL ORDER BY ts`,
+		eid, start, end)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	total := 0.0
+	for rows.Next() {
+		var v float64
+		if err := rows.Scan(&v); err != nil {
+			return 0, err
+		}
+		if havePrev {
+			if d := v - prev; d > 0 {
+				total += d
+			}
+		}
+		prev, havePrev = v, true
+	}
+	return total, rows.Err()
+}
+
 func (h *History) Close() {
 	if h.pool != nil {
 		h.pool.Close()

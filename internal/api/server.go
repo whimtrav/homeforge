@@ -52,8 +52,12 @@ type Server struct {
 	store         *entity.Store
 	bus           *bus.Bus
 
-	reload  func() error
-	history *history.History
+	reload              func() error
+	deviceRestart       func(name string) error
+	deviceOtaPrep       func(name string, secs int) error
+	deviceEnterRecovery func(name string) error
+	alexaCfg            config.AlexaConfig
+	history             *history.History
 
 	autoMu      sync.RWMutex
 	automations []config.AutomationConfig
@@ -96,6 +100,11 @@ func NewServer(cfg config.APIConfig, store *entity.Store, b *bus.Bus) *Server {
 
 func (s *Server) SetReload(fn func() error) { s.reload = fn }
 
+// SetDeviceRestart / SetDeviceOtaPrep wire the liquidfw device-maintenance actions.
+func (s *Server) SetDeviceRestart(fn func(string) error)       { s.deviceRestart = fn }
+func (s *Server) SetDeviceOtaPrep(fn func(string, int) error)  { s.deviceOtaPrep = fn }
+func (s *Server) SetDeviceEnterRecovery(fn func(string) error) { s.deviceEnterRecovery = fn }
+
 func (s *Server) SetHistory(h *history.History) { s.history = h }
 
 func (s *Server) SetAutomations(a []config.AutomationConfig) {
@@ -121,8 +130,63 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"reloaded"}`))
 }
 
+// handleDeviceRestart reboots a LiquidFW device — POST /api/devices/{name}/restart.
+func (s *Server) handleDeviceRestart(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if s.deviceRestart == nil {
+		http.Error(w, "device restart not configured", http.StatusNotImplemented)
+		return
+	}
+	if err := s.deviceRestart(name); err != nil {
+		slog.Error("api: device restart failed", "device", name, "err", err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	slog.Info("api: device restart", "device", name)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true}`))
+}
+
+// handleDeviceOtaPrep puts a LiquidFW device into OTA-prep mode (suspend heavy
+// loops + drop relays so an OTA won't be starved) — POST /api/devices/{name}/ota_prep.
+func (s *Server) handleDeviceOtaPrep(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if s.deviceOtaPrep == nil {
+		http.Error(w, "device ota_prep not configured", http.StatusNotImplemented)
+		return
+	}
+	if err := s.deviceOtaPrep(name, 300); err != nil {
+		slog.Error("api: device ota_prep failed", "device", name, "err", err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	slog.Info("api: device ota_prep", "device", name)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true,"ota_prep":300}`))
+}
+
+// handleDeviceEnterRecovery remotely drops a LiquidFW device (fw>=0.4.6) into recovery mode so it
+// can be OTA'd with no physical power-cycle — POST /api/devices/{name}/enter_recovery.
+func (s *Server) handleDeviceEnterRecovery(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if s.deviceEnterRecovery == nil {
+		http.Error(w, "device enter_recovery not configured", http.StatusNotImplemented)
+		return
+	}
+	if err := s.deviceEnterRecovery(name); err != nil {
+		slog.Error("api: device enter_recovery failed", "device", name, "err", err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	slog.Info("api: device enter_recovery", "device", name)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true,"mode":"recovery"}`))
+}
+
 // handleHistory serves recorded state history for one entity.
-//   GET /api/history/{id}?start=&end=&resolution=
+//
+//	GET /api/history/{id}?start=&end=&resolution=
+//
 // start/end accept RFC3339 or unix seconds (default: last 24h). resolution is
 // raw|1m|1h (empty auto-selects by range).
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
@@ -165,7 +229,8 @@ const waterUsageTZ = "America/Denver"
 
 // handleWaterUsage integrates a flow-rate entity (gal/min) over calendar-aligned
 // windows and returns gallons used this hour/today/this week/this month.
-//   GET /api/water/usage?entity=sensor.droplet_fe5c_flow
+//
+//	GET /api/water/usage?entity=sensor.droplet_fe5c_flow
 func (s *Server) handleWaterUsage(w http.ResponseWriter, r *http.Request) {
 	if s.history == nil {
 		http.Error(w, "history disabled", http.StatusNotImplemented)
@@ -256,10 +321,10 @@ func bodyComp(weight, impedance float64) []bcRow {
 	var visc float64
 	if height < weight*1.6 {
 		sub := ((height * 0.4) - (height * (height * 0.0826))) * -1
-		visc = ((weight*305)/(sub+48)) - 2.9 + age*0.15
+		visc = ((weight * 305) / (sub + 48)) - 2.9 + age*0.15
 	} else {
 		sub := 0.765 + height*-0.0015
-		visc = (((height*0.143)-(weight*sub))*-1) + age*0.15 - 5.0
+		visc = (((height * 0.143) - (weight * sub)) * -1) + age*0.15 - 5.0
 	}
 	visc = clamp(visc, 1, 50)
 	bmr := clamp(877.8+weight*14.916-height*0.726-age*8.976, 500, 10000)
@@ -294,7 +359,7 @@ func (s *Server) handleScale(w http.ResponseWriter, r *http.Request) {
 	// keep the latest raw report visible for inspection while we finalize the decoder
 	s.store.Set(entity.Entity{
 		ID: "sensor.scale_" + id + "_raw", Name: device + " scale raw", Domain: "sensor",
-		State: strconv.Itoa(len(trimmed)) + " bytes",
+		State:      strconv.Itoa(len(trimmed)) + " bytes",
 		Attributes: map[string]any{"device": "scale", "section": "health", "raw": trimmed},
 	})
 
@@ -341,6 +406,13 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/services/{domain}/{service}", s.handleServiceCall)
 	mux.HandleFunc("GET /api/ws", s.handleWebSocket)
 	mux.HandleFunc("POST /api/reload", s.handleReload)
+	mux.HandleFunc("POST /api/devices/{name}/restart", s.handleDeviceRestart)
+	mux.HandleFunc("POST /api/devices/{name}/ota_prep", s.handleDeviceOtaPrep)
+	mux.HandleFunc("POST /api/devices/{name}/enter_recovery", s.handleDeviceEnterRecovery)
+	mux.HandleFunc("POST /api/alexa/directive", s.handleAlexaDirective)
+	mux.HandleFunc("GET /api/alexa/oauth/authorize", s.handleAlexaAuthorize)
+	mux.HandleFunc("POST /api/alexa/oauth/authorize", s.handleAlexaAuthorize)
+	mux.HandleFunc("POST /api/alexa/oauth/token", s.handleAlexaToken)
 	mux.HandleFunc("GET /api/automations", s.handleAutomations)
 	mux.HandleFunc("POST /api/automations/{name}/enabled", s.handleAutomationEnabled)
 	mux.HandleFunc("GET /api/floorplan", s.handleFloorplanGet)
@@ -349,6 +421,8 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("PUT /api/floorplan/vents", s.handleVentsPut)
 	mux.HandleFunc("GET /api/history/{id}", s.handleHistory)
 	mux.HandleFunc("GET /api/water/usage", s.handleWaterUsage)
+	mux.HandleFunc("GET /api/energy/cycle", s.handleEnergyCycle)
+	mux.HandleFunc("POST /api/energy/cycle/rectify", s.handleEnergyRectify)
 	mux.HandleFunc("POST /api/scale/{device}", s.handleScale)
 	mux.HandleFunc("POST /api/comfort", s.handleComfort)
 	mux.HandleFunc("POST /api/health", s.handleHealth)
@@ -387,6 +461,8 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	slog.Info("api: listening", "addr", addr)
+
+	go s.runAlexaReminders(ctx)
 
 	go func() {
 		<-ctx.Done()
@@ -512,8 +588,10 @@ func (s *Server) handleComfort(w http.ResponseWriter, r *http.Request) {
 // cuff, a smart scale, etc.). Body = a flat JSON object of metric:value (numbers), with two
 // optional reserved keys: "timestamp" (RFC3339) and "units" ({metric: unit}). Each numeric
 // metric → sensor.health_<metric> (logged to history automatically) + a raw JSONL audit line.
-//   e.g. {"weight_kg":80.5,"bmi":24.2,"bp_systolic":121,"bp_diastolic":78,"heart_rate":61,
-//         "steps":8432,"units":{"weight_kg":"kg","heart_rate":"bpm"}}
+//
+//	e.g. {"weight_kg":80.5,"bmi":24.2,"bp_systolic":121,"bp_diastolic":78,"heart_rate":61,
+//	      "steps":8432,"units":{"weight_kg":"kg","heart_rate":"bpm"}}
+//
 // defaultHealthPerson is who health data is attributed to when no ?person= is given.
 const defaultHealthPerson = "Bo"
 

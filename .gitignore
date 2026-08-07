@@ -10,8 +10,8 @@ config.yaml.*
 *credential*
 
 # ── Backups / scratch ──
-*bak*
 *.bak
+*bak*
 *.pre-*
 *.orig
 *.tmp
@@ -26,7 +26,7 @@ data/
 *.log
 
 # ── Build output ──
-homeforge
+/homeforge
 *.exe
 internal/api/webdist/*
 !internal/api/webdist/.gitkeep

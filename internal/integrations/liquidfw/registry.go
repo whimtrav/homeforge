@@ -17,8 +17,8 @@ type device struct {
 	IdentityPub  [32]byte  `json:"identity_pub"`  // long-term; used for TOFU auth
 	EphemeralPub [32]byte  `json:"ephemeral_pub"` // current session ephemeral pub
 	SessionKey   [32]byte  `json:"session_key"`
-	CmdNonce     uint64    `json:"cmd_nonce"`   // outbound HMAC nonce (monotonic, persisted)
-	LastNonce    uint64    `json:"last_nonce"`  // last received STATE nonce
+	CmdNonce     uint64    `json:"cmd_nonce"`  // outbound HMAC nonce (monotonic, persisted)
+	LastNonce    uint64    `json:"last_nonce"` // last received STATE nonce
 	LastSeen     time.Time `json:"last_seen"`
 }
 
@@ -127,12 +127,16 @@ func (r *registry) get(deviceID uint32) *device {
 func (r *registry) findByName(name string) *device {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	// Prefer the most-recently-seen device when names collide. A physically replaced
+	// device leaves a stale registry entry; without this, random map-iteration order
+	// could route commands to the dead device. Freshest LastSeen wins.
+	var best *device
 	for _, d := range r.devices {
-		if d.Name == name {
-			return d
+		if d.Name == name && (best == nil || d.LastSeen.After(best.LastSeen)) {
+			best = d
 		}
 	}
-	return nil
+	return best
 }
 
 // updateFromState validates nonce (replay protection) and persists name when first seen.

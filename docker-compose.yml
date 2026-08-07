@@ -7,7 +7,6 @@ services:
     network_mode: host
     depends_on:
       - timescaledb
-      - ollama
     volumes:
       - ./config.yaml:/etc/homeforge/config.yaml:ro
       - homeforge_data:/data
@@ -69,6 +68,8 @@ services:
   hubspace-bridge:
     build: ./hubspace
     container_name: hubspace-bridge
+    volumes:
+      - hubspace_data:/data
     restart: unless-stopped
     network_mode: host
     env_file: ./hubspace/.env
@@ -145,6 +146,7 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: homeforge-ollama
+    profiles: ["ai"]
     restart: unless-stopped
     ports:
       - "127.0.0.1:11435:11434"
@@ -168,6 +170,7 @@ services:
   whisper:
     image: onerahmet/openai-whisper-asr-webservice:latest
     container_name: homeforge-whisper
+    profiles: ["ai"]
     restart: unless-stopped
     ports:
       - "127.0.0.1:9010:9000"
@@ -189,6 +192,7 @@ services:
   piper:
     build: ./piper
     container_name: homeforge-piper
+    profiles: ["ai"]
     restart: unless-stopped
     ports:
       - "127.0.0.1:5111:5050"
@@ -219,6 +223,7 @@ services:
 
 volumes:
   homeforge_data:
+  hubspace_data:
   homeforge_tsdb:
   ollama_models:
   whisper_models:

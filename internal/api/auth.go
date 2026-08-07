@@ -276,7 +276,28 @@ func secureCookie(r *http.Request) bool {
 // calls bypass the gate). Call before Start so the middleware can wrap the mux.
 func (s *Server) SetAuth(c config.AuthConfig) {
 	s.auth = newAuthStore(c)
-	s.internalToken = randToken()
+	s.internalToken = loadOrCreateInternalToken(c.UsersFile)
+}
+
+// loadOrCreateInternalToken persists the internal/device token so it survives restarts —
+// trusted LAN devices (wall panels) bake it in and send it as X-HF-Internal. Stored next to
+// the users file so it lands in the same data dir.
+func loadOrCreateInternalToken(usersFile string) string {
+	if strings.TrimSpace(usersFile) == "" {
+		return randToken()
+	}
+	path := strings.TrimSuffix(usersFile, ".json") + "-internal-token"
+	if b, err := os.ReadFile(path); err == nil {
+		if t := strings.TrimSpace(string(b)); t != "" {
+			return t
+		}
+	}
+	tok := randToken()
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, []byte(tok), 0600) == nil {
+		os.Rename(tmp, path)
+	}
+	return tok
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
@@ -299,10 +320,12 @@ func (s *Server) authAllowed(r *http.Request) bool {
 	// only the public auth endpoints bypass the gate; account management (/api/auth/users,
 	// change-password, …) still requires a session.
 	switch p {
-	case "/api/auth/me", "/api/auth/login", "/api/auth/setup", "/api/auth/logout":
+	case "/api/auth/me", "/api/auth/login", "/api/auth/setup", "/api/auth/logout",
+		"/api/alexa/oauth/authorize", "/api/alexa/oauth/token": // authorize self-gates (HF login form); token self-gates (client_secret)
 		return true
 	}
 	if r.Method == http.MethodPost && (p == "/api/health" || p == "/api/comfort" ||
+		p == "/api/alexa/directive" || // Alexa Lambda → HF; self-auths via shared token
 		strings.HasPrefix(p, "/api/scale/") || strings.HasPrefix(p, "/api/ble/")) {
 		return true
 	}

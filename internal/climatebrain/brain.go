@@ -61,6 +61,7 @@ type Manager struct {
 	baseSet     float64 // the user's intended cool setpoint (pre-cool restores to this)
 	haveBase    bool
 	precooling  bool    // brain is currently holding the setpoint below base
+	precoolSince time.Time // when the current pre-cool session engaged (hysteresis + min-dwell)
 	lastCmd     float64 // last setpoint the brain commanded (to detect user overrides)
 	freeCooling bool    // brain is running the attic+box fans for free cooling (cooler out than in)
 
@@ -661,6 +662,8 @@ func (m *Manager) handlePrecool(mode string, haveSet bool, setpoint float64, hav
 
 	offset := orFloat(m.cfg.PrecoolOffset, 3)
 	exportW := orFloat(m.cfg.PrecoolExportW, 400)
+	exportOff := orFloat(m.cfg.PrecoolExportOffW, exportW/3)
+	dwell := time.Duration(orFloat(m.cfg.PrecoolMinDwellMin, 20)) * time.Minute
 	maxOut := orFloat(m.cfg.PrecoolMaxOut, 92)
 	minF := orFloat(m.cfg.PrecoolMinF, 68)
 
@@ -683,9 +686,14 @@ func (m *Manager) handlePrecool(mode string, haveSet bool, setpoint float64, hav
 		target = minF
 	}
 
-	// Qualify: cool mode, real solar surplus, AC still efficient, and room to bank coolth.
-	qualify := mode == "cool" && m.haveBase && grid < -exportW &&
+	// Hysteresis + min-dwell so a passing cloud can't flip-flop the setpoint (that short-cycles the
+	// AC and wears the compressor). START needs strong export + headroom to bank; once engaged we
+	// HOLD the target (no restore-and-drift on "banked") until export truly ends AND the dwell has
+	// elapsed — one sustained pre-cool session per solar window, not dozens of setpoint bounces.
+	startQualify := mode == "cool" && m.haveBase && grid < -exportW &&
 		(!haveOut || outdoor <= maxOut) && haveCur && current > target+0.3
+	holdQualify := mode == "cool" && m.haveBase && grid < -exportOff &&
+		(!haveOut || outdoor <= maxOut)
 
 	reason := ""
 	switch {
@@ -693,26 +701,36 @@ func (m *Manager) handlePrecool(mode string, haveSet bool, setpoint float64, hav
 		reason = "not cooling"
 	case !m.haveBase:
 		reason = "no setpoint yet"
-	case grid >= -exportW:
+	case !m.precooling && grid >= -exportW:
 		reason = "no solar surplus"
+	case m.precooling && grid >= -exportOff:
+		reason = "solar surplus ended"
 	case haveOut && outdoor > maxOut:
 		reason = fmt.Sprintf("too hot out (%.0f°F)", outdoor)
-	case haveCur && current <= target+0.3:
-		reason = "already banked"
+	case !m.precooling && haveCur && current <= target+0.3:
+		reason = "already at target"
 	}
 
-	if qualify {
-		if !m.precooling || math.Abs(setpoint-target) > 0.4 {
+	if !m.precooling {
+		if startQualify {
 			m.setTemp(target)
 			m.lastCmd = target
 			m.precooling = true
+			m.precoolSince = time.Now()
 			slog.Info("climatebrain: pre-cooling", "target", target, "base", m.baseSet, "export_w", -grid)
 		}
-	} else if m.precooling {
-		m.setTemp(m.baseSet)
-		m.lastCmd = m.baseSet
-		m.precooling = false
-		slog.Info("climatebrain: pre-cool end → restore", "base", m.baseSet, "reason", reason)
+	} else {
+		// Hold the session; stand down only after export has really ended AND the min-dwell passed.
+		if !holdQualify && time.Since(m.precoolSince) >= dwell {
+			m.setTemp(m.baseSet)
+			m.lastCmd = m.baseSet
+			m.precooling = false
+			slog.Info("climatebrain: pre-cool end → restore", "base", m.baseSet, "reason", reason)
+		} else if math.Abs(setpoint-target) > 0.4 {
+			// base/target moved while holding -> re-assert once (not a bounce)
+			m.setTemp(target)
+			m.lastCmd = target
+		}
 	}
 
 	state := "hold"

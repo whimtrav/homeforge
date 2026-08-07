@@ -185,6 +185,65 @@ func (m *Manager) SendToDevice(name string, body map[string]any) error {
 	return sendCmd(d, m.reg, raw)
 }
 
+// Restart reboots a device by name via its unauthenticated /restart endpoint.
+func (m *Manager) Restart(name string) error {
+	if m.reg == nil {
+		return fmt.Errorf("liquidfw not started")
+	}
+	d := m.reg.findByName(name)
+	if d == nil {
+		return fmt.Errorf("unknown device: %s", name)
+	}
+	if d.IP == "" {
+		return fmt.Errorf("no IP for device %s", name)
+	}
+	resp, err := cmdHTTP.Post("http://"+d.IP+"/restart", "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("device returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// EnterRecovery remotely drops a device into recovery mode via its /enter_recovery endpoint
+// (firmware >=0.4.6) so it can be OTA'd without a physical power-cycle. Recovery is sticky
+// until the device is reflashed (or GET /boot), so this can't leave it in a bad state.
+func (m *Manager) EnterRecovery(name string) error {
+	if m.reg == nil {
+		return fmt.Errorf("liquidfw not started")
+	}
+	d := m.reg.findByName(name)
+	if d == nil {
+		return fmt.Errorf("unknown device: %s", name)
+	}
+	if d.IP == "" {
+		return fmt.Errorf("no IP for device %s", name)
+	}
+	resp, err := cmdHTTP.Post("http://"+d.IP+"/enter_recovery", "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("device returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// OtaPrep puts a device into OTA-prep mode for secs seconds: the device suspends
+// heavy per-loop work (BLE scan / panel render) and drops its relays to a safe
+// state so an OTA transfer isn't starved (needed for the busy BLE-scanner devices).
+// It auto-expires on the device, so it can never get stuck. secs<=0 → 300.
+func (m *Manager) OtaPrep(name string, secs int) error {
+	if secs <= 0 {
+		secs = 300
+	}
+	return m.SendToDevice(name, map[string]any{"ota_prep": secs})
+}
+
 // handleCmd processes an inbound MQTT command for a LiquidFW entity.
 // HA sends: liquidfw/switch.liquidfw_test_led/set {"state":"on"}
 // Entity attrs carry "device" (device name) and "pin_name" (original pin key).
