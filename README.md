@@ -77,6 +77,10 @@ emporia/ vesync/ kidde/ hubspace/ piper/   optional docker-compose sidecars
 docker-compose.yml  full stack (core services + the `ai` profile)
 ```
 
+## Troubleshooting
+
+Running on an AMD Ryzen mini-PC that randomly reboots/freezes at idle, or hardening a headless box to self-heal? See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
+
 ## Building from source
 
 ```bash
