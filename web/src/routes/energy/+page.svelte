@@ -129,7 +129,7 @@
       .sort((a, b) => b.power - a.power)
   })
 
-  // Big appliances = the 5 the user gauges. Mixed sources: DualR3 BL0939 meters + Emporia CTs.
+  // Big appliances = the 5 key gauges. Mixed sources: DualR3 BL0939 meters + Emporia CTs.
   const num = (id: string) => {
     const e = ents[id]
     if (!e) return null
