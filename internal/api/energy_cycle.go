@@ -88,7 +88,27 @@ func (s *Server) handleEnergyCycle(w http.ResponseWriter, r *http.Request) {
 	}
 	imp := calc("sensor.solar_grid_energy_in")
 	exp := calc("sensor.solar_grid_energy_out")
+	gen := calc("sensor.solar_pv_energy")
+	use := calc("sensor.solar_load_energy")
 	days := int(end.Sub(start).Hours()/24) + 1
+
+	// "Made vs used" net = generation − consumption over a window. + = made more than used (GREEN),
+	// − = used more than made (RED). The card's red/green tiles color on THIS (the user's rule),
+	// not grid import/export — a battery day can import overnight yet still out-produce the house.
+	madeNet := func(a, b time.Time) float64 {
+		g, e1 := s.history.CycleTotal(r.Context(), "sensor.solar_pv_energy", a, b)
+		u, e2 := s.history.CycleTotal(r.Context(), "sensor.solar_load_energy", a, b)
+		if e1 != nil || e2 != nil {
+			return 0
+		}
+		return math.Round((g-u)*10) / 10
+	}
+	nowLoc := end.In(loc)
+	todayStart := time.Date(nowLoc.Year(), nowLoc.Month(), nowLoc.Day(), 0, 0, 0, 0, loc)
+	yestStart := todayStart.AddDate(0, 0, -1)
+	todayMadeNet := madeNet(todayStart, end)
+	yesterdayMadeNet := madeNet(yestStart, todayStart)
+	monthMadeNet := math.Round((gen-use)*10) / 10
 
 	var bank, bankPrev float64
 	if n := len(st.Bills); n > 0 {
@@ -99,18 +119,21 @@ func (s *Server) handleEnergyCycle(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"cycle_start":   st.CycleStart,
-		"day":           days,
-		"expected_days": 30,
-		"grid_import":   imp,
-		"grid_export":   exp,
-		"grid_net":      math.Round((imp-exp)*10) / 10, // + = net import (drawing the bank), - = banking
-		"generation":    calc("sensor.solar_pv_energy"),
-		"consumption":   calc("sensor.solar_load_energy"),
-		"needs_bill":    days >= 30, // ~a cycle old → the bill should be here → prompt to log it
-		"bank_kwh":      bank,
-		"bank_delta":    math.Round((bank-bankPrev)*10) / 10,
-		"bills":         st.Bills,
+		"cycle_start":        st.CycleStart,
+		"day":                days,
+		"expected_days":      30,
+		"grid_import":        imp,
+		"grid_export":        exp,
+		"grid_net":           math.Round((imp-exp)*10) / 10, // + = net import (drawing the bank), - = banking
+		"generation":         gen,
+		"consumption":        use,
+		"made_net":           monthMadeNet,     // cycle generation − consumption; GREEN if ≥0 (made ≥ used)
+		"today_made_net":     todayMadeNet,     // today so far (local day), made − used
+		"yesterday_made_net": yesterdayMadeNet, // full prior local day, made − used
+		"needs_bill":         days >= 30,       // ~a cycle old → the bill should be here → prompt to log it
+		"bank_kwh":           bank,
+		"bank_delta":         math.Round((bank-bankPrev)*10) / 10,
+		"bills":              st.Bills,
 	})
 }
 

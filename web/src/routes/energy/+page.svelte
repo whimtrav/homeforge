@@ -167,10 +167,28 @@
         <h2 class="text-sm font-semibold uppercase tracking-wide" style="color: var(--text-muted)">Billing Cycle</h2>
         <div class="text-xs" style="color: var(--text-muted)">since {cycle.cycle_start} · day {cycle.day} of ~{cycle.expected_days}</div>
       </div>
+      <!-- Made vs used: GREEN when generation ≥ consumption (net positive), RED when used more than made. Yesterday · today-so-far · whole cycle. -->
+      <div class="grid gap-3 mt-3" style="grid-template-columns: repeat(3, 1fr)">
+        <div class="rounded-lg p-3 text-center" style="background: {cycle.yesterday_made_net >= 0 ? 'rgba(78,161,114,0.13)' : 'rgba(224,106,92,0.13)'}">
+          <div class="text-xs uppercase tracking-wide" style="color: var(--text-muted)">Yesterday</div>
+          <div class="text-2xl font-bold" style="color: {cycle.yesterday_made_net >= 0 ? '#4ea172' : '#e06a5c'}">{cycle.yesterday_made_net > 0 ? '+' : ''}{cycle.yesterday_made_net}</div>
+          <div class="text-xs" style="color: var(--text-muted)">kWh · {cycle.yesterday_made_net >= 0 ? 'made more' : 'used more'}</div>
+        </div>
+        <div class="rounded-lg p-3 text-center" style="background: {cycle.today_made_net >= 0 ? 'rgba(78,161,114,0.13)' : 'rgba(224,106,92,0.13)'}">
+          <div class="text-xs uppercase tracking-wide" style="color: var(--text-muted)">Today so far</div>
+          <div class="text-2xl font-bold" style="color: {cycle.today_made_net >= 0 ? '#4ea172' : '#e06a5c'}">{cycle.today_made_net > 0 ? '+' : ''}{cycle.today_made_net}</div>
+          <div class="text-xs" style="color: var(--text-muted)">kWh · {cycle.today_made_net >= 0 ? 'made more' : 'used more'}</div>
+        </div>
+        <div class="rounded-lg p-3 text-center" style="background: {cycle.made_net >= 0 ? 'rgba(78,161,114,0.13)' : 'rgba(224,106,92,0.13)'}">
+          <div class="text-xs uppercase tracking-wide" style="color: var(--text-muted)">This cycle</div>
+          <div class="text-2xl font-bold" style="color: {cycle.made_net >= 0 ? '#4ea172' : '#e06a5c'}">{cycle.made_net > 0 ? '+' : ''}{cycle.made_net}</div>
+          <div class="text-xs" style="color: var(--text-muted)">day {cycle.day} · {cycle.made_net >= 0 ? 'made more' : 'used more'}</div>
+        </div>
+      </div>
       <div class="grid gap-3 mt-3" style="grid-template-columns: repeat(auto-fit, minmax(105px, 1fr))">
         <div><div class="text-xl font-bold" style="color: var(--text)">{cycle.grid_import}</div><div class="text-xs" style="color: var(--text-muted)">Import kWh</div></div>
         <div><div class="text-xl font-bold" style="color: var(--text)">{cycle.grid_export}</div><div class="text-xs" style="color: var(--text-muted)">Export kWh</div></div>
-        <div><div class="text-xl font-bold" style="color: {cycle.grid_net > 0 ? '#e06a5c' : '#4ea172'}">{cycle.grid_net > 0 ? '+' : ''}{cycle.grid_net}</div><div class="text-xs" style="color: var(--text-muted)">Net {cycle.grid_net > 0 ? '(import)' : '(banked)'}</div></div>
+        <div><div class="text-xl font-bold" style="color: var(--text)">{cycle.grid_net > 0 ? '+' : ''}{cycle.grid_net}</div><div class="text-xs" style="color: var(--text-muted)">Grid net {cycle.grid_net > 0 ? '(import)' : '(export)'}</div></div>
         <div><div class="text-xl font-bold" style="color: var(--text)">{cycle.generation}</div><div class="text-xs" style="color: var(--text-muted)">Generated</div></div>
         <div><div class="text-xl font-bold" style="color: var(--text)">{cycle.consumption}</div><div class="text-xs" style="color: var(--text-muted)">Used</div></div>
         <div><div class="text-xl font-bold" style="color: var(--accent)">{cycle.bank_kwh}</div><div class="text-xs" style="color: var(--text-muted)">Credit bank{cycle.bank_delta ? ' ' + (cycle.bank_delta > 0 ? '+' : '') + cycle.bank_delta : ''}</div></div>
