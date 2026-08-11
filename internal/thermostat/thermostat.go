@@ -149,18 +149,24 @@ func (m *Manager) Run(ctx context.Context) {
 		m.handleService(svc, data, source)
 	})
 
-	// Optional presence-driven auto-away.
-	if m.cfg.PresenceEntity != "" {
+	// Optional presence-driven auto-away. The house is "occupied" if ANY configured source
+	// reads home/on — all family phones' device_trackers PLUS in-house mmwave presence sensors.
+	// It only flips to the away preset once EVERY source is clear for away_after_min. This is
+	// deliberately conservative: never set the climate to away while anyone is home, whether by
+	// phone OR by in-house presence.
+	if ids := m.presenceSources(); len(ids) > 0 {
+		want := map[string]bool{}
+		for _, id := range ids {
+			want[id] = true
+		}
 		m.bus.Subscribe(entity.TopicStateChanged, func(ev bus.Event) {
 			p, ok := ev.Payload.(entity.StateChangedPayload)
-			if !ok || p.Entity.ID != m.cfg.PresenceEntity {
+			if !ok || !want[p.Entity.ID] {
 				return
 			}
-			m.onPresence(p.Entity.State)
+			m.setPresence(m.anyPresent())
 		})
-		if e, ok := m.store.Get(m.cfg.PresenceEntity); ok {
-			m.onPresence(e.State)
-		}
+		m.setPresence(m.anyPresent()) // seed from current states
 	}
 
 	// Live UI refresh: whenever a temp probe reports (~5s), re-read the probes and
@@ -353,12 +359,34 @@ func (m *Manager) handleService(svc string, data map[string]any, source string) 
 	}
 }
 
-func (m *Manager) onPresence(state string) {
-	home := false
-	switch strings.ToLower(strings.TrimSpace(state)) {
-	case "home", "on", "true", "occupied":
-		home = true
+// presenceSources returns every configured presence entity (the list + the legacy single).
+func (m *Manager) presenceSources() []string {
+	ids := append([]string{}, m.cfg.PresenceEntities...)
+	if m.cfg.PresenceEntity != "" {
+		ids = append(ids, m.cfg.PresenceEntity)
 	}
+	return ids
+}
+
+// anyPresent reports whether ANY presence source reads home/on — i.e. someone is home, by
+// phone or by in-house presence. Used so away never engages while the house is occupied.
+func (m *Manager) anyPresent() bool {
+	for _, id := range m.presenceSources() {
+		e, ok := m.store.Get(id)
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(e.State)) {
+		case "home", "on", "true", "occupied":
+			return true
+		}
+	}
+	return false
+}
+
+// setPresence records occupancy: returning to occupied leaves away immediately; going empty
+// starts the empty-house timer (checkAutoAway flips to away once it exceeds away_after_min).
+func (m *Manager) setPresence(home bool) {
 	m.mu.Lock()
 	was := m.presenceHome
 	m.presenceHome = home
@@ -379,7 +407,7 @@ func (m *Manager) onPresence(state string) {
 
 // checkAutoAway flips to the away preset once the house has been empty long enough.
 func (m *Manager) checkAutoAway() {
-	if m.cfg.PresenceEntity == "" {
+	if len(m.presenceSources()) == 0 {
 		return
 	}
 	after := time.Duration(orInt(m.cfg.AwayAfterMin, 15)) * time.Minute

@@ -289,21 +289,22 @@ type DisaggConfig struct {
 // on-device thermostat (the DrZzs D1-mini relay board). Presets carry separate
 // heat/cool setpoints so away/eco save in both seasons.
 type ThermostatConfig struct {
-	Enabled         bool               `yaml:"enabled"`
-	Device          string             `yaml:"device"`    // LiquidFW device name (e.g. climate-control)
-	MQTTHost        string             `yaml:"mqtt_host"` // broker carrying the temp topics (e.g. 10.0.0.5)
-	MQTTPort        int                `yaml:"mqtt_port"` // default 1883
-	MQTTUser        string             `yaml:"mqtt_user"`
-	MQTTPass        string             `yaml:"mqtt_pass"`
-	TempSensors     []ThermostatSensor `yaml:"temp_sensors"`      // topics to average
-	PushIntervalSec int                `yaml:"push_interval_sec"` // default 30
-	MinTemp         float64            `yaml:"min_temp"`          // default 55
-	MaxTemp         float64            `yaml:"max_temp"`          // default 88
-	StateFile       string             `yaml:"state_file"`        // default /data/thermostat.json
-	Presets         []ThermostatPreset `yaml:"presets"`           // home/away/sleep/eco
-	PresenceEntity  string             `yaml:"presence_entity"`   // optional entity → auto-away when not home
-	AwayAfterMin    int                `yaml:"away_after_min"`    // minutes not-home before away (default 15)
-	Circulate       CirculateConfig    `yaml:"circulate"`         // blower destratification policy
+	Enabled          bool               `yaml:"enabled"`
+	Device           string             `yaml:"device"`    // LiquidFW device name (e.g. climate-control)
+	MQTTHost         string             `yaml:"mqtt_host"` // broker carrying the temp topics (e.g. 10.0.0.5)
+	MQTTPort         int                `yaml:"mqtt_port"` // default 1883
+	MQTTUser         string             `yaml:"mqtt_user"`
+	MQTTPass         string             `yaml:"mqtt_pass"`
+	TempSensors      []ThermostatSensor `yaml:"temp_sensors"`      // topics to average
+	PushIntervalSec  int                `yaml:"push_interval_sec"` // default 30
+	MinTemp          float64            `yaml:"min_temp"`          // default 55
+	MaxTemp          float64            `yaml:"max_temp"`          // default 88
+	StateFile        string             `yaml:"state_file"`        // default /data/thermostat.json
+	Presets          []ThermostatPreset `yaml:"presets"`           // home/away/sleep/eco
+	PresenceEntity   string             `yaml:"presence_entity"`   // legacy single entity → auto-away when not home
+	PresenceEntities []string           `yaml:"presence_entities"` // occupied if ANY reads home/on (phones + mmwave); away only when ALL clear
+	AwayAfterMin     int                `yaml:"away_after_min"`    // minutes fully-empty before away (default 15)
+	Circulate        CirculateConfig    `yaml:"circulate"`         // blower destratification policy
 }
 
 // CirculateConfig = HomeForge's blower-circulation (destratify) policy. When the two floors
