@@ -77,11 +77,21 @@ type APIConfig struct {
 }
 
 type MQTTConfig struct {
-	External bool   `yaml:"external"`
-	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
+	External   bool        `yaml:"external"`
+	Host       string      `yaml:"host"`
+	Port       int         `yaml:"port"`
+	Username   string      `yaml:"username"`
+	Password   string      `yaml:"password"`
+	ZwaveLocks []ZwaveLock `yaml:"zwave_locks"`
+}
+
+// ZwaveLock maps a zwave-js-ui named node segment to a HomeForge lock entity, for door
+// locks paired locally to a Z-Wave stick (via zwave-js-ui) instead of a cloud hub.
+// See internal/mqtt handleZwaveState.
+type ZwaveLock struct {
+	Node string `yaml:"node"` // zwave-js-ui named topic segment, e.g. "Front_Door"
+	ID   string `yaml:"id"`   // entity id suffix -> lock.<id>
+	Name string `yaml:"name"` // friendly name
 }
 
 type DatabaseConfig struct {

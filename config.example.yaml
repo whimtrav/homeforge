@@ -14,6 +14,12 @@ mqtt:
   port: 1883
   # username: ""
   # password: ""
+  # Local Z-Wave door locks bridged in via zwave-js-ui (see internal/mqtt handleZwaveState).
+  # `node` is the zwave-js-ui *named* topic segment — name the node in zwave-js-ui, spaces
+  # become underscores. HomeForge creates lock.<id> and controls it locally (no cloud hub).
+  # zwave_locks:
+  #   - {node: "Front_Door", id: "front_door", name: "Front Door"}
+  #   - {node: "Garage", id: "garage", name: "Garage"}
 
 history:
   enabled: true             # long-term history in TimescaleDB (see docker-compose.yml)

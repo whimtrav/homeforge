@@ -164,6 +164,28 @@ func (s *Server) onConnect(c mqttclient.Client) {
 	// Ring (ring-mqtt sidecar): HA discovery on homeassistant/# seeds entities; ring/# carries state.
 	c.Subscribe("ring/#", 0, s.handleRingState)
 
+	// zwave-js-ui door locks: value topics zwave/nodeID_<n>/98/0/<prop> carry state; commands
+	// go back out via handleServiceCallMQTT. (HA discovery for zwave is disabled — its generic
+	// entities are unusable; this dedicated handler makes clean, controllable lock entities.)
+	c.Subscribe("zwave/#", 0, s.handleZwaveState)
+	// Purge the junk lock entities the generic HA-discovery path created before this handler.
+	for _, id := range []string{"lock.currentmode_nodeid_3_lock", "lock.currentmode_nodeid_4_lock"} {
+		s.store.Delete(id)
+	}
+	// Seed the zwave-js-ui locks so they exist + route to zwave even before a state message
+	// arrives. HF's embedded broker drops retained messages on restart, so without this Ring
+	// would re-seed these ids as source "ring" and commands would go to the dead Ring path.
+	// Last-known state comes from the boot snapshot; live state follows via handleZwaveState.
+	for _, lk := range s.cfg.ZwaveLocks {
+		state := "unknown"
+		if rs, ok := s.store.Restored("lock." + lk.ID); ok && rs != "" {
+			state = rs
+		}
+		s.store.Set(entity.Entity{ID: "lock." + lk.ID, Name: lk.Name, Domain: "lock", State: state,
+			Attributes: map[string]any{"source": "zwavejs", "friendly_name": lk.Name,
+				"device": lk.ID, "command_topic": "zwave/" + lk.Node + "/98/0/targetMode/set"}})
+	}
+
 	// Hydrific Droplet water sensor — plain MQTT (droplet-<id>/{state,leak,health})
 	c.Subscribe("droplet-FE5C/+", 0, s.handleDroplet)
 
@@ -659,6 +681,12 @@ func (s *Server) handleRingDiscovery(domain string, cfg map[string]any, stateTop
 		return
 	}
 	id := domain + "." + sanitizeID(slug)
+	// zwave-js-ui owns these locks (migrated off Ring); never let Ring seed/clobber them.
+	for _, lk := range s.cfg.ZwaveLocks {
+		if id == "lock."+lk.ID {
+			return
+		}
+	}
 	tmpl, _ := cfg["value_template"].(string)
 
 	s.ringMu.Lock()
@@ -762,6 +790,82 @@ func ringExtract(payload []byte, tmpl string) (string, bool) {
 	default:
 		return fmt.Sprintf("%v", v), true
 	}
+}
+
+// zwaveLockBySegment returns the configured lock (config: mqtt.zwave_locks) for a zwave-js-ui
+// named node segment. We key on the NAMED segment because zwave-js-ui uses the node name in
+// both the state and the /set topics once a node is named; the nodeID_<n> topics carry state
+// only, not commands.
+func (s *Server) zwaveLockBySegment(seg string) (config.ZwaveLock, bool) {
+	for _, lk := range s.cfg.ZwaveLocks {
+		if lk.Node == seg {
+			return lk, true
+		}
+	}
+	return config.ZwaveLock{}, false
+}
+
+// handleZwaveState ingests zwave-js-ui Door Lock (CC 98) state and keeps a lock.<id>
+// entity in sync. Topics: zwave/nodeID_<n>/98/0/{boltStatus,currentMode}, payload
+// {"time":..,"value":..}. Commands go out via handleServiceCallMQTT (source "zwavejs").
+func (s *Server) handleZwaveState(_ mqttclient.Client, msg mqttclient.Message) {
+	parts := strings.Split(msg.Topic(), "/")
+	if len(parts) < 5 || parts[2] != "98" {
+		return
+	}
+	lk, ok := s.zwaveLockBySegment(parts[1])
+	if !ok {
+		return
+	}
+	var obj map[string]any
+	if json.Unmarshal(msg.Payload(), &obj) != nil {
+		return
+	}
+	state := ""
+	switch parts[len(parts)-1] {
+	case "boltStatus":
+		if sv, _ := obj["value"].(string); sv != "" {
+			if ls := strings.ToLower(sv); ls == "locked" || ls == "unlocked" {
+				state = ls
+			}
+		}
+	case "currentMode":
+		if fv, ok := obj["value"].(float64); ok {
+			switch int(fv) {
+			case 255:
+				state = "locked"
+			case 0:
+				state = "unlocked"
+			}
+		}
+	default:
+		return
+	}
+	if state == "" {
+		return
+	}
+
+	id := "lock." + lk.ID
+	e, exists := s.store.Get(id)
+	src, _ := e.Attributes["source"].(string)
+	needMeta := !exists || src != "zwavejs" // seed, or convert a stale ring/other entity
+	if needMeta {
+		e = entity.Entity{ID: id, Domain: "lock", Attributes: map[string]any{}}
+	}
+	if e.Attributes == nil {
+		e.Attributes = map[string]any{}
+	}
+	e.Name = lk.Name
+	e.Domain = "lock"
+	e.Attributes["source"] = "zwavejs"
+	e.Attributes["friendly_name"] = lk.Name
+	e.Attributes["device"] = lk.ID
+	e.Attributes["command_topic"] = "zwave/" + parts[1] + "/98/0/targetMode/set"
+	if e.State == state && !needMeta {
+		return
+	}
+	e.State = state
+	s.store.Set(e)
 }
 
 // handleTasmotaDiscovery parses retained Tasmota auto-discovery messages to seed
@@ -873,6 +977,29 @@ func (s *Server) handleServiceCallMQTT(entityID, service string, data map[string
 	}
 	if _, isWled := e.Attributes["wled_host"]; isWled {
 		return // WLED handled by the wled integration directly
+	}
+
+	// zwave-js-ui door locks: set the Door Lock target mode (255 = lock, 0 = unlock) by
+	// publishing {"value":N} to the value's /set topic.
+	if src, _ := e.Attributes["source"].(string); src == "zwavejs" {
+		ct, _ := e.Attributes["command_topic"].(string)
+		if ct == "" {
+			return
+		}
+		lc := strings.ToLower(service)
+		val := -1
+		switch {
+		case strings.HasSuffix(lc, ".unlock"):
+			val = 0
+		case strings.HasSuffix(lc, ".lock"):
+			val = 255
+		}
+		if val < 0 {
+			return
+		}
+		s.Publish(ct, []byte(fmt.Sprintf(`{"value":%d}`, val)))
+		slog.Info("zwave: lock command", "entity", entityID, "value", val)
+		return
 	}
 
 	// Ring devices: publish HA-standard payloads to the entity's command_topic (ring-mqtt sidecar).
