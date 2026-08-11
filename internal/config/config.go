@@ -155,6 +155,15 @@ type IntegrationsConfig struct {
 	ClimateBrain ClimateBrainConfig `yaml:"climate_brain"`
 	Rachio       RachioConfig       `yaml:"rachio"`
 	Alexa        AlexaConfig        `yaml:"alexa"`
+	Occupancy    OccupancyConfig    `yaml:"occupancy"`
+}
+
+// OccupancyConfig = the "is anyone home?" engine. Combines phones + motion/mmwave + physical
+// switch presses into binary_sensor.home_occupied (see internal/occupancy). Point the thermostat
+// presence_entities at that so auto-away never fires while the house is in use.
+type OccupancyConfig struct {
+	Enabled  bool `yaml:"enabled"`
+	GraceMin int  `yaml:"grace_min"` // minutes of no motion/press + all phones away before "empty" (default 20)
 }
 
 // AlexaConfig = native Alexa Smart Home skill support. HF exposes the curated

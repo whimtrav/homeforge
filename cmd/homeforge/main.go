@@ -29,6 +29,7 @@ import (
 	"github.com/whimtrav/homeforge/internal/integrations/wiz"
 	"github.com/whimtrav/homeforge/internal/integrations/wled"
 	"github.com/whimtrav/homeforge/internal/mqtt"
+	"github.com/whimtrav/homeforge/internal/occupancy"
 	"github.com/whimtrav/homeforge/internal/thermostat"
 )
 
@@ -228,6 +229,11 @@ func main() {
 
 	// Virtual groups (room light groups etc.) — no-op if none configured.
 	go groups.NewManager(cfg.Groups, store, eventBus).Run(ctx)
+
+	// Occupancy engine → binary_sensor.home_occupied (phones + motion/mmwave + physical presses).
+	if cfg.Integrations.Occupancy.Enabled {
+		go occupancy.NewManager(cfg.Integrations.Occupancy, store, eventBus).Run(ctx)
+	}
 
 	if cfg.Integrations.LiquidFW.Enabled {
 		lfw := liquidfw.NewManager(cfg.Integrations.LiquidFW, store, eventBus)
