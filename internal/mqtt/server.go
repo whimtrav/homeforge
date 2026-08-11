@@ -372,6 +372,7 @@ func (s *Server) handleSentinel(_ mqttclient.Client, msg mqttclient.Message) {
 	var ev struct {
 		Type  string `json:"type"`
 		After struct {
+			ID       string  `json:"id"`
 			Camera   string  `json:"camera"`
 			Label    string  `json:"label"`
 			TopScore float64 `json:"top_score"`
@@ -394,6 +395,37 @@ func (s *Server) handleSentinel(_ mqttclient.Client, msg mqttclient.Message) {
 			"camera": ev.After.Camera, "object": ev.After.Label, "score": ev.After.TopScore,
 		},
 	})
+
+	// Tap-to-clip push on a matching FIRST detection (fires once per event on "new"). The push
+	// carries the event id (click "clip:<id>") so the app opens that exact clip.
+	if ev.Type == "new" && ev.After.ID != "" {
+		for _, r := range s.cfg.SentinelNotify {
+			label := r.Label
+			if label == "" {
+				label = "person"
+			}
+			if !strings.EqualFold(r.Camera, ev.After.Camera) || !strings.EqualFold(label, ev.After.Label) {
+				continue
+			}
+			title := r.Title
+			if title == "" {
+				title = fmt.Sprintf("%s %s", ev.After.Camera, ev.After.Label)
+			}
+			message := r.Message
+			if message == "" {
+				message = fmt.Sprintf("%s detected at %s", ev.After.Label, ev.After.Camera)
+			}
+			channel := r.Channel
+			if channel == "" {
+				channel = "doorbell"
+			}
+			s.sendPush(map[string]any{
+				"title": title, "message": message, "channel": channel,
+				"tag": "sentinel_" + sanitizeID(ev.After.Camera), "click": "clip:" + ev.After.ID,
+			})
+			break
+		}
+	}
 }
 
 // handleSolarAssistant ingests Solar Assistant telemetry (bridged from its mosquitto).
