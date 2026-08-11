@@ -12,14 +12,15 @@ import (
 	"sync"
 	"time"
 
+	mqttclient "github.com/eclipse/paho.mqtt.golang"
 	mqttserver "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
 	"github.com/mochi-mqtt/server/v2/listeners"
-	mqttclient "github.com/eclipse/paho.mqtt.golang"
 
 	"github.com/whimtrav/homeforge/internal/bus"
 	"github.com/whimtrav/homeforge/internal/config"
 	"github.com/whimtrav/homeforge/internal/entity"
+	"github.com/whimtrav/homeforge/internal/push"
 )
 
 const TopicMQTTMessage = "mqtt.message"
@@ -191,7 +192,7 @@ func (s *Server) onConnect(c mqttclient.Client) {
 	// Hydrific Droplet water sensor — plain MQTT (droplet-<id>/{state,leak,health})
 	c.Subscribe("droplet-FE5C/+", 0, s.handleDroplet)
 
-		// Tasmota auto-discovery (retained).
+	// Tasmota auto-discovery (retained).
 	c.Subscribe("tasmota/discovery/#", 0, s.handleTasmotaDiscovery)
 
 	// LiquidFW device command subscriptions.
@@ -362,7 +363,9 @@ func (s *Server) handleTasmota(_ mqttclient.Client, msg mqttclient.Message) {
 }
 
 // handleSentinel ingests Sentinel's Frigate-compatible detection event stream:
-//   frigate/events → {"type":"new"|"update"|"end","after":{"camera","label",...}}
+//
+//	frigate/events → {"type":"new"|"update"|"end","after":{"camera","label",...}}
+//
 // → binary_sensor.sentinel_{camera}_{label} = on while a detection is active, off on "end".
 // Good enough for "person/car at <camera>" automations. (The full JSON is kept in attributes.)
 func (s *Server) handleSentinel(_ mqttclient.Client, msg mqttclient.Message) {
@@ -997,11 +1000,53 @@ func (s *Server) sendNtfy(data map[string]any) {
 	slog.Info("notify: sent", "title", data["title"], "code", resp.StatusCode)
 }
 
+// sendPush fans a notify.* action out to registered app devices via FCM (the push relay).
+// The Android channel comes from data.channel, or is derived from data.priority when absent:
+// urgent/max -> critical, high -> doorbell, low/min -> motion, else default. data.click (if
+// present) rides along as a deep-link target the app opens when the notification is tapped.
+func (s *Server) sendPush(data map[string]any) {
+	msg, _ := data["message"].(string)
+	if msg == "" {
+		msg = "HomeForge alert"
+	}
+	title, _ := data["title"].(string)
+	if title == "" {
+		title = "HomeForge"
+	}
+	channel, _ := data["channel"].(string)
+	if channel == "" {
+		switch p, _ := data["priority"].(string); p {
+		case "urgent", "max":
+			channel = "critical"
+		case "high":
+			channel = "doorbell"
+		case "low", "min":
+			channel = "motion"
+		default:
+			channel = "default"
+		}
+	}
+	tag, _ := data["tag"].(string)
+	if tag == "" { // collapse repeats of the same event type by default
+		tag = channel
+	}
+	var pdata map[string]string
+	if click, ok := data["click"].(string); ok && click != "" {
+		pdata = map[string]string{"click": click}
+	}
+	image, _ := data["image"].(string)
+	push.Send(s.cfg.PushRelayURL, push.Payload{
+		Title: title, Message: msg, Image: image, Channel: channel, Tag: tag, Data: pdata,
+	})
+}
+
 // handleServiceCallMQTT publishes MQTT commands for Zigbee2MQTT and Tasmota entities.
 func (s *Server) handleServiceCallMQTT(entityID, service string, data map[string]any) {
-	// Push notifications (ntfy) — handled before the entity lookup (no entity needed).
+	// Push notifications — handled before the entity lookup (no entity needed). Fans out to both
+	// the ntfy topic (if configured) and the in-app FCM relay (registered devices).
 	if strings.HasPrefix(service, "notify.") {
 		s.sendNtfy(data)
+		s.sendPush(data)
 		return
 	}
 	if s.client == nil {

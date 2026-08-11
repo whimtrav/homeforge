@@ -443,6 +443,8 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/auth/login", s.handleAuthLogin)
 	mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
 	mux.HandleFunc("POST /api/auth/change-password", s.handleChangePassword)
+	mux.HandleFunc("POST /api/push/register", s.handlePushRegister)
+	mux.HandleFunc("POST /api/push/unregister", s.handlePushUnregister)
 	mux.HandleFunc("GET /api/auth/users", s.handleListUsers)
 	mux.HandleFunc("POST /api/auth/users", s.handleAddUser)
 	mux.HandleFunc("DELETE /api/auth/users/{email}", s.handleDeleteUser)

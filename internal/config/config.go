@@ -39,19 +39,19 @@ type AuthConfig struct {
 // CPU-only 4-core / 8GB box (the Beelink port target) — no GPU dependency.
 type AssistantConfig struct {
 	Enabled     bool    `yaml:"enabled"`
-	Model       string  `yaml:"model"`        // ollama model tag
-	OllamaURL   string  `yaml:"ollama_url"`   // ollama /api/chat endpoint
-	NumCtx      int     `yaml:"num_ctx"`      // context window (KV cache); must fit prompt+history+reply
-	NumPredict  int     `yaml:"num_predict"`  // max generated tokens per step (bounds latency)
-	NumThread   int     `yaml:"num_thread"`   // CPU threads (0 = ollama auto)
-	NumGPU      int     `yaml:"num_gpu"`      // GPU layers; 0 = CPU-only
+	Model       string  `yaml:"model"`       // ollama model tag
+	OllamaURL   string  `yaml:"ollama_url"`  // ollama /api/chat endpoint
+	NumCtx      int     `yaml:"num_ctx"`     // context window (KV cache); must fit prompt+history+reply
+	NumPredict  int     `yaml:"num_predict"` // max generated tokens per step (bounds latency)
+	NumThread   int     `yaml:"num_thread"`  // CPU threads (0 = ollama auto)
+	NumGPU      int     `yaml:"num_gpu"`     // GPU layers; 0 = CPU-only
 	Temperature float64 `yaml:"temperature"`
-	MaxSteps    int     `yaml:"max_steps"`    // agent-loop bound
-	DeviceCap   int     `yaml:"device_cap"`   // devices listed in the (static, cacheable) prompt
-	Prewarm     bool    `yaml:"prewarm"`      // prime model + prompt cache on startup
-	MemoryFile  string  `yaml:"memory_file"`  // durable remembered-facts store (JSON)
-	WhisperURL  string  `yaml:"whisper_url"`  // local speech-to-text service (voice input)
-	PiperURL    string  `yaml:"piper_url"`    // local neural TTS service (spoken replies)
+	MaxSteps    int     `yaml:"max_steps"`   // agent-loop bound
+	DeviceCap   int     `yaml:"device_cap"`  // devices listed in the (static, cacheable) prompt
+	Prewarm     bool    `yaml:"prewarm"`     // prime model + prompt cache on startup
+	MemoryFile  string  `yaml:"memory_file"` // durable remembered-facts store (JSON)
+	WhisperURL  string  `yaml:"whisper_url"` // local speech-to-text service (voice input)
+	PiperURL    string  `yaml:"piper_url"`   // local neural TTS service (spoken replies)
 }
 
 // GroupConfig defines a virtual switch that fans service calls out to its members
@@ -77,13 +77,14 @@ type APIConfig struct {
 }
 
 type MQTTConfig struct {
-	External   bool        `yaml:"external"`
-	Host       string      `yaml:"host"`
-	Port       int         `yaml:"port"`
-	Username   string      `yaml:"username"`
-	Password   string      `yaml:"password"`
-	NtfyURL    string      `yaml:"ntfy_url"` // ntfy topic URL for push alerts, e.g. https://ntfy.sh/<topic>
-	ZwaveLocks []ZwaveLock `yaml:"zwave_locks"`
+	External     bool        `yaml:"external"`
+	Host         string      `yaml:"host"`
+	Port         int         `yaml:"port"`
+	Username     string      `yaml:"username"`
+	Password     string      `yaml:"password"`
+	NtfyURL      string      `yaml:"ntfy_url"`       // ntfy topic URL for push alerts, e.g. https://ntfy.sh/<topic>
+	PushRelayURL string      `yaml:"push_relay_url"` // FCM push-relay URL; empty = shared default (push.DefaultRelayURL)
+	ZwaveLocks   []ZwaveLock `yaml:"zwave_locks"`
 }
 
 // ZwaveLock maps a zwave-js-ui named node segment to a HomeForge lock entity, for door
@@ -114,8 +115,8 @@ type TriggerConfig struct {
 	From   string   `yaml:"from,omitempty"`
 	Cron   string   `yaml:"cron,omitempty"`
 	Topic  string   `yaml:"topic,omitempty"`
-	Above  *float64 `yaml:"above,omitempty"` // numeric trigger: fire on cross up through this value
-	Below  *float64 `yaml:"below,omitempty"` // numeric trigger: fire on cross down through this value
+	Above  *float64 `yaml:"above,omitempty"`  // numeric trigger: fire on cross up through this value
+	Below  *float64 `yaml:"below,omitempty"`  // numeric trigger: fire on cross down through this value
 	Event  string   `yaml:"event,omitempty"`  // sun trigger: "sunrise" | "sunset"
 	Offset int      `yaml:"offset,omitempty"` // sun trigger: minutes relative to the event (+after, -before)
 }
@@ -197,16 +198,16 @@ type ClimateBrainConfig struct {
 	BlockMin        int    `yaml:"block_min"`        // A/B arm length in minutes (default 30)
 
 	// ── Phase 2: actuation + learning ──
-	PrecoolActuate bool    `yaml:"precool_actuate"`     // nudge the cool setpoint DOWN to bank solar coolth
-	PrecoolOffset  float64 `yaml:"precool_offset"`      // max °F below the base setpoint (default 3)
-	PrecoolExportW float64 `yaml:"precool_export_w"`    // min solar export in W to trigger (default 400)
+	PrecoolActuate     bool    `yaml:"precool_actuate"`       // nudge the cool setpoint DOWN to bank solar coolth
+	PrecoolOffset      float64 `yaml:"precool_offset"`        // max °F below the base setpoint (default 3)
+	PrecoolExportW     float64 `yaml:"precool_export_w"`      // min solar export in W to trigger (default 400)
 	PrecoolExportOffW  float64 `yaml:"precool_export_off_w"`  // hysteresis: only DISENGAGE below this export W (default exportW/3) — stops cloud flip-flop
 	PrecoolMinDwellMin float64 `yaml:"precool_min_dwell_min"` // once pre-cooling, HOLD at least this many minutes (default 20)
-	PrecoolMaxOut  float64 `yaml:"precool_max_outdoor"` // above this °F outdoor the AC is too inefficient (default 92)
-	PrecoolMinF    float64 `yaml:"precool_min_f"`       // hard floor °F — never pre-cool below (default 68)
-	AtticAutoRun   bool    `yaml:"attic_auto_run"`      // once A/B says the fan helps, run it during hot+sun
-	AtticMargin    float64 `yaml:"attic_margin"`        // min AC-duty improvement (fraction) to call it a win (default 0.05)
-	ComfortModel   bool    `yaml:"comfort_model"`       // learn a comfortable setpoint from /data/comfort-feedback.jsonl
+	PrecoolMaxOut      float64 `yaml:"precool_max_outdoor"`   // above this °F outdoor the AC is too inefficient (default 92)
+	PrecoolMinF        float64 `yaml:"precool_min_f"`         // hard floor °F — never pre-cool below (default 68)
+	AtticAutoRun       bool    `yaml:"attic_auto_run"`        // once A/B says the fan helps, run it during hot+sun
+	AtticMargin        float64 `yaml:"attic_margin"`          // min AC-duty improvement (fraction) to call it a win (default 0.05)
+	ComfortModel       bool    `yaml:"comfort_model"`         // learn a comfortable setpoint from /data/comfort-feedback.jsonl
 	// Humidity sources (room RH complements the probe RH; VeSync humidifiers report these).
 	UpHumidity   []string `yaml:"up_humidity"`   // upstairs RH entity ids
 	DownHumidity []string `yaml:"down_humidity"` // downstairs RH entity ids
@@ -232,9 +233,9 @@ type ClimateBrainConfig struct {
 	// setpoint DOWN to pull UPSTAIRS (not the up/down average) to the cap + run the fans. The
 	// average-based thermostat won't do this on its own, so upstairs sits warm on hot afternoons.
 	HeatGuard        bool    `yaml:"heat_guard"`
-	HeatGuardHotOut  float64 `yaml:"heat_guard_hot_out"` // engage only when outdoor ≥ this °F (default 88)
-	HeatGuardCap     float64 `yaml:"heat_guard_cap"`     // max upstairs °F allowed on a hot day (default 75)
-	HeatGuardFloor   float64 `yaml:"heat_guard_floor"`   // hard floor — never command below this °F (default 70)
+	HeatGuardHotOut  float64 `yaml:"heat_guard_hot_out"`  // engage only when outdoor ≥ this °F (default 88)
+	HeatGuardCap     float64 `yaml:"heat_guard_cap"`      // max upstairs °F allowed on a hot day (default 75)
+	HeatGuardFloor   float64 `yaml:"heat_guard_floor"`    // hard floor — never command below this °F (default 70)
 	HeatGuardMaxDrop float64 `yaml:"heat_guard_max_drop"` // max °F below base the guard will command (default 4)
 
 	// Manual-override hold: when the user sets the setpoint (UI/assistant), the brain + all
