@@ -51,6 +51,8 @@ type Server struct {
 	internalToken string
 	store         *entity.Store
 	bus           *bus.Bus
+	homeLat       float64 // home zone centre (from integrations.weather) for presence
+	homeLon       float64
 
 	reload              func() error
 	deviceRestart       func(name string) error
@@ -446,6 +448,8 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/push/register", s.handlePushRegister)
 	mux.HandleFunc("POST /api/push/unregister", s.handlePushUnregister)
 	mux.HandleFunc("POST /api/mobile/sensors", s.handleMobileSensors)
+	mux.HandleFunc("GET /api/mobile/config", s.handleMobileConfig)
+	mux.HandleFunc("POST /api/mobile/config", s.handleMobileConfigSet)
 	mux.HandleFunc("GET /api/auth/users", s.handleListUsers)
 	mux.HandleFunc("POST /api/auth/users", s.handleAddUser)
 	mux.HandleFunc("DELETE /api/auth/users/{email}", s.handleDeleteUser)

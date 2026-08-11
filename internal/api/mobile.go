@@ -3,13 +3,76 @@ package api
 import (
 	"encoding/json"
 	"log/slog"
+	"math"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/whimtrav/homeforge/internal/entity"
 )
+
+// homeRadiusMeters is how close to the home coordinates counts as "home".
+const homeRadiusMeters = 150.0
+
+// mobileHomeFile persists the user-set precise home coordinates (the weather lat/lon is only a
+// city-level reference and is too coarse for a geofence).
+const mobileHomeFile = "/data/mobile-home.json"
+
+// SetHome seeds the home-zone centre from integrations.weather, then applies any user-set
+// precise home saved on disk (which overrides the coarse weather point).
+func (s *Server) SetHome(lat, lon float64) {
+	s.homeLat, s.homeLon = lat, lon
+	if b, err := os.ReadFile(mobileHomeFile); err == nil {
+		var h struct{ Latitude, Longitude float64 }
+		if json.Unmarshal(b, &h) == nil && (h.Latitude != 0 || h.Longitude != 0) {
+			s.homeLat, s.homeLon = h.Latitude, h.Longitude
+		}
+	}
+}
+
+// handleMobileConfig (GET) tells the app where home is, so it can register a geofence there.
+func (s *Server) handleMobileConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{
+		"home": map[string]any{
+			"latitude": s.homeLat, "longitude": s.homeLon, "radius": homeRadiusMeters,
+		},
+	})
+}
+
+// handleMobileConfigSet (POST) sets the precise home to the given coordinates (typically the
+// phone's current location, captured while the user is home) and persists it.
+func (s *Server) handleMobileConfigSet(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Latitude  *float64 `json:"latitude"`
+		Longitude *float64 `json:"longitude"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<14)).Decode(&req); err != nil ||
+		req.Latitude == nil || req.Longitude == nil {
+		http.Error(w, "latitude+longitude required", http.StatusBadRequest)
+		return
+	}
+	s.homeLat, s.homeLon = *req.Latitude, *req.Longitude
+	b, _ := json.Marshal(map[string]any{"latitude": s.homeLat, "longitude": s.homeLon})
+	tmp := mobileHomeFile + ".tmp"
+	if os.WriteFile(tmp, b, 0644) == nil {
+		_ = os.Rename(tmp, mobileHomeFile)
+	}
+	slog.Info("api: home set", "lat", s.homeLat, "lon", s.homeLon)
+	writeJSON(w, map[string]any{"ok": true, "latitude": s.homeLat, "longitude": s.homeLon, "radius": homeRadiusMeters})
+}
+
+// haversineMeters is the great-circle distance between two lat/lon points, in metres.
+func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
+	const R = 6371000.0
+	rad := math.Pi / 180
+	dLat := (lat2 - lat1) * rad
+	dLon := (lon2 - lon1) * rad
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat1*rad)*math.Cos(lat2*rad)*math.Sin(dLon/2)*math.Sin(dLon/2)
+	return R * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+}
 
 // Mobile companion-app sensor ingest. The HomeForge app pushes phone sensors here (battery,
 // connectivity, device, activity) plus optional location/presence. Each reading becomes an
@@ -138,13 +201,26 @@ func (s *Server) handleMobileSensors(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Optional location -> device_tracker.<phone> (home / not_home), for presence automations.
+	// The app may send an explicit zone (from a geofence enter/exit) OR just lat/lon, in which
+	// case we compute home/away against the configured home zone.
 	if loc := req.Location; loc != nil {
 		st := strings.ToLower(strings.TrimSpace(loc.Zone))
 		switch st {
 		case "home":
 			st = "home"
-		case "", "away", "not_home", "nothome":
+		case "away", "not_home", "nothome":
 			st = "not_home"
+		default:
+			// No explicit zone — derive it from coordinates if we have both.
+			if loc.Latitude != nil && loc.Longitude != nil && (s.homeLat != 0 || s.homeLon != 0) {
+				if haversineMeters(*loc.Latitude, *loc.Longitude, s.homeLat, s.homeLon) <= homeRadiusMeters {
+					st = "home"
+				} else {
+					st = "not_home"
+				}
+			} else {
+				st = "not_home"
+			}
 		}
 		attr := map[string]any{
 			"device": dev, "section": "phone", "phone_name": name,

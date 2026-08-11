@@ -2,28 +2,28 @@ package main
 
 import (
 	"context"
-	"sync"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/whimtrav/homeforge/internal/api"
 	"github.com/whimtrav/homeforge/internal/automation"
 	"github.com/whimtrav/homeforge/internal/bus"
+	"github.com/whimtrav/homeforge/internal/climatebrain"
 	"github.com/whimtrav/homeforge/internal/config"
 	"github.com/whimtrav/homeforge/internal/entity"
 	"github.com/whimtrav/homeforge/internal/groups"
 	"github.com/whimtrav/homeforge/internal/history"
+	"github.com/whimtrav/homeforge/internal/integrations/disagg"
 	"github.com/whimtrav/homeforge/internal/integrations/esphome"
 	"github.com/whimtrav/homeforge/internal/integrations/liquidfw"
-	"github.com/whimtrav/homeforge/internal/integrations/sonoff"
-	"github.com/whimtrav/homeforge/internal/climatebrain"
-	"github.com/whimtrav/homeforge/internal/integrations/disagg"
 	"github.com/whimtrav/homeforge/internal/integrations/rachio"
+	"github.com/whimtrav/homeforge/internal/integrations/sonoff"
 	"github.com/whimtrav/homeforge/internal/integrations/tigo"
 	"github.com/whimtrav/homeforge/internal/integrations/weather"
 	"github.com/whimtrav/homeforge/internal/integrations/wiz"
@@ -151,6 +151,7 @@ func main() {
 	apiSrv.SetAssistant(cfg.Assistant)
 	apiSrv.SetAutomationState(autoState)
 	apiSrv.SetAlexa(cfg.Integrations.Alexa)
+	apiSrv.SetHome(cfg.Integrations.Weather.Lat, cfg.Integrations.Weather.Lon)
 	apiSrv.SetReload(func() error {
 		newCfg, err := config.Load(cfgPath)
 		if err != nil {
