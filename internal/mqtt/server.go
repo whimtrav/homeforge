@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	mqttserver "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
@@ -961,8 +963,47 @@ func (s *Server) handleLiquidFWSet(_ mqttclient.Client, msg mqttclient.Message) 
 	})
 }
 
+// sendNtfy delivers a push notification via ntfy (config: mqtt.ntfy_url). Free, self-hostable;
+// the phone subscribes to the topic in the ntfy app. Message/title/priority/tags come from the
+// automation action's `data`. No-op if ntfy_url is unset.
+func (s *Server) sendNtfy(data map[string]any) {
+	url := s.cfg.NtfyURL
+	if url == "" {
+		return
+	}
+	msg, _ := data["message"].(string)
+	if msg == "" {
+		msg = "HomeForge alert"
+	}
+	req, err := http.NewRequest("POST", url, strings.NewReader(msg))
+	if err != nil {
+		return
+	}
+	if v, ok := data["title"].(string); ok && v != "" {
+		req.Header.Set("Title", v)
+	}
+	if v, ok := data["priority"].(string); ok && v != "" {
+		req.Header.Set("Priority", v)
+	}
+	if v, ok := data["tags"].(string); ok && v != "" {
+		req.Header.Set("Tags", v)
+	}
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		slog.Warn("notify: ntfy post failed", "err", err)
+		return
+	}
+	resp.Body.Close()
+	slog.Info("notify: sent", "title", data["title"], "code", resp.StatusCode)
+}
+
 // handleServiceCallMQTT publishes MQTT commands for Zigbee2MQTT and Tasmota entities.
 func (s *Server) handleServiceCallMQTT(entityID, service string, data map[string]any) {
+	// Push notifications (ntfy) — handled before the entity lookup (no entity needed).
+	if strings.HasPrefix(service, "notify.") {
+		s.sendNtfy(data)
+		return
+	}
 	if s.client == nil {
 		return
 	}

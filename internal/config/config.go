@@ -82,6 +82,7 @@ type MQTTConfig struct {
 	Port       int         `yaml:"port"`
 	Username   string      `yaml:"username"`
 	Password   string      `yaml:"password"`
+	NtfyURL    string      `yaml:"ntfy_url"` // ntfy topic URL for push alerts, e.g. https://ntfy.sh/<topic>
 	ZwaveLocks []ZwaveLock `yaml:"zwave_locks"`
 }
 

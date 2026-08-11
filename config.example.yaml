@@ -14,6 +14,10 @@ mqtt:
   port: 1883
   # username: ""
   # password: ""
+  # Push notifications via ntfy (see internal/mqtt sendNtfy). Automations call the `notify.push`
+  # service with data {title, message, priority, tags}; it POSTs to this ntfy topic. Subscribe
+  # to the topic in the ntfy app to receive alerts. Use a random, hard-to-guess topic.
+  # ntfy_url: "https://ntfy.sh/your-random-topic"
   # Local Z-Wave door locks bridged in via zwave-js-ui (see internal/mqtt handleZwaveState).
   # `node` is the zwave-js-ui *named* topic segment — name the node in zwave-js-ui, spaces
   # become underscores. HomeForge creates lock.<id> and controls it locally (no cloud hub).
