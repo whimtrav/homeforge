@@ -39,12 +39,14 @@ type authStore struct {
 	ownerEmail   string
 	usersPath    string
 	sessPath     string
+	profilesPath string
 	sessionDays  int
 	cookieDomain string
 	users       map[string]authUser
 	sessions    map[string]authSession
-	fails       map[string]int   // client ip -> recent failed logins
-	blockUntil  map[string]int64 // client ip -> unix time
+	profiles    map[string]userProfile // per-account scope overlay (auth-profiles.json); empty = unrestricted
+	fails       map[string]int         // client ip -> recent failed logins
+	blockUntil  map[string]int64       // client ip -> unix time
 }
 
 func newAuthStore(c config.AuthConfig) *authStore {
@@ -53,10 +55,12 @@ func newAuthStore(c config.AuthConfig) *authStore {
 		ownerEmail:   strings.ToLower(strings.TrimSpace(c.OwnerEmail)),
 		usersPath:    c.UsersFile,
 		sessPath:     strings.TrimSuffix(c.UsersFile, ".json") + "-sessions.json",
+		profilesPath: strings.TrimSuffix(c.UsersFile, ".json") + "-profiles.json",
 		sessionDays:  c.SessionDays,
 		cookieDomain: strings.TrimSpace(c.CookieDomain),
 		users:       map[string]authUser{},
 		sessions:    map[string]authSession{},
+		profiles:    map[string]userProfile{},
 		fails:       map[string]int{},
 		blockUntil:  map[string]int64{},
 	}
@@ -78,6 +82,7 @@ func (a *authStore) load() {
 	if data, err := os.ReadFile(a.sessPath); err == nil {
 		_ = json.Unmarshal(data, &a.sessions)
 	}
+	a.loadProfiles()
 }
 
 func (a *authStore) persistUsers() {
@@ -357,10 +362,31 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 			authed, email = true, e
 		}
 	}
-	writeJSON(w, map[string]any{
+	resp := map[string]any{
 		"authenticated": authed, "email": email,
 		"needsSetup": !s.auth.hasUsers(), "ownerEmail": s.auth.ownerEmail, "enabled": s.auth.enabled,
-	})
+	}
+	if authed {
+		// Surface the account's profile so the app can scope itself (single-room home, own health,
+		// which tabs to show). Owner / no-profile accounts report is_owner + the full tab set, and
+		// blank home_room/health_person so the app behaves exactly as before.
+		prof, hasProf := s.auth.profileFor(email)
+		isOwner := !hasProf || prof.IsOwner
+		tabs := prof.Tabs
+		if isOwner || len(tabs) == 0 {
+			tabs = defaultTabs
+		}
+		display := prof.DisplayName
+		if display == "" {
+			display = email
+		}
+		resp["is_owner"] = isOwner
+		resp["display_name"] = display
+		resp["home_room"] = prof.HomeRoom         // "" for owner → app shows all rooms
+		resp["health_person"] = prof.HealthPerson // "" for owner → app falls back to "bo"
+		resp["tabs"] = tabs
+	}
+	writeJSON(w, resp)
 }
 
 func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {

@@ -449,12 +449,20 @@ func (m *Manager) handleServiceCall(entityID, service string, data map[string]an
 	}
 
 	body, _ := json.Marshal(map[string]any{"method": "setPilot", "params": params})
-	if _, err := query(ip, body); err != nil {
-		slog.Warn("wiz: setPilot failed", "entity", entityID, "err", err)
-		return
-	}
-	slog.Info("wiz: cmd", "entity", entityID, "params", params)
-	m.optimistic(e, sub, params)
+	m.optimistic(e, sub, params) // reflect intent immediately (UI + automation idempotency)
+	// WiZ bulbs drop ~10% of UDP packets and HF gets no ack on a lost one, so a single
+	// send can silently miss (light doesn't switch). Retry up to 3× (a real miss -> ~0.1%).
+	// Async so a slow/dead bulb never blocks the shared service bus.
+	go func() {
+		for attempt := 1; attempt <= 3; attempt++ {
+			if _, err := query(ip, body); err == nil {
+				slog.Info("wiz: cmd", "entity", entityID, "params", params, "attempt", attempt)
+				return
+			}
+			time.Sleep(150 * time.Millisecond)
+		}
+		slog.Warn("wiz: setPilot failed after 3 tries", "entity", entityID)
+	}()
 }
 
 // optimistic updates the store immediately so the UI reacts before the next poll.

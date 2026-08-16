@@ -1,5 +1,5 @@
 // Package disagg is a HomeForge integration that disaggregates the single BL0939
-// meter on the "washerdryer" DualR3 (e.g. 10.0.0.20) into the THREE loads sharing that
+// meter on the "washerdryer" DualR3 (192.168.1.85) into the THREE loads sharing that
 // circuit: the LG washer/dryer combo, a sump pump, and an automatic cat litter box.
 //
 // It polls the device /state every 2s and runs a priority state machine keyed off the

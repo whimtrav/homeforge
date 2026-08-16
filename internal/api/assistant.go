@@ -64,6 +64,7 @@ type olResponse struct {
 func (s *Server) SetAssistant(c config.AssistantConfig) {
 	s.assistantCfg = c
 	s.mem = newAssistantMemory(c.MemoryFile)
+	s.devMap = loadDeviceMap(deviceMapPath)
 	if c.Enabled && c.Prewarm {
 		go s.prewarmAssistant()
 	}
@@ -107,6 +108,7 @@ func (s *Server) handleAssistant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "need {message}", http.StatusBadRequest)
 		return
 	}
+	email, _ := s.sessionEmail(r)
 
 	messages := []olMessage{{Role: "system", Content: s.assistantSystemPrompt()}}
 	messages = append(messages, req.History...)
@@ -127,6 +129,7 @@ func (s *Server) handleAssistant(w http.ResponseWriter, r *http.Request) {
 		}
 		messages = append(messages, msg)
 		if len(msg.ToolCalls) == 0 {
+			s.logAIActivity(email, "ask", req.Message, msg.Content, actions)
 			writeJSON(w, map[string]any{"reply": msg.Content, "actions": actions})
 			return
 		}
@@ -136,6 +139,7 @@ func (s *Server) handleAssistant(w http.ResponseWriter, r *http.Request) {
 			messages = append(messages, olMessage{Role: "tool", Content: result, ToolName: tc.Function.Name})
 		}
 	}
+	s.logAIActivity(email, "ask", req.Message, "(took too many steps)", actions)
 	writeJSON(w, map[string]any{"reply": "(took too many steps — try rephrasing)", "actions": actions})
 }
 
@@ -162,27 +166,33 @@ func (s *Server) assistantSystemPrompt() string {
 	b.WriteString("- When the user tells you to remember something (a preference, a name, how they refer to a place), call remember. When they say to forget something, call forget. Saved facts appear below and you should use them.\n")
 	b.WriteString("- Answer EVERY part of the question, using the exact room/period asked.\n")
 	b.WriteString("- After acting, confirm in ONE short sentence. If ambiguous, ask a brief clarifying question instead of guessing.\n\n")
-	b.WriteString("Controllable devices (entity_id — name):\n")
-	type row struct{ id, name string }
-	var rows []row
-	for _, e := range s.store.All() {
-		if assistantDomains[strings.SplitN(e.ID, ".", 2)[0]] {
-			rows = append(rows, row{e.ID, e.Name})
+	if g := s.groundingSection(); g != "" {
+		b.WriteString(g)
+	} else {
+		b.WriteString("Controllable devices (entity_id — name):\n")
+		type row struct{ id, name string }
+		var rows []row
+		for _, e := range s.store.All() {
+			if assistantDomains[strings.SplitN(e.ID, ".", 2)[0]] {
+				rows = append(rows, row{e.ID, e.Name})
+			}
 		}
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
-	limit := s.assistantCfg.DeviceCap
-	if limit <= 0 {
-		limit = 150
-	}
-	for i, r := range rows {
-		if i >= limit {
-			fmt.Fprintf(&b, "...(%d more — use find_devices)\n", len(rows)-limit)
-			break
+		sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+		limit := s.assistantCfg.DeviceCap
+		if limit <= 0 {
+			limit = 150
 		}
-		fmt.Fprintf(&b, "%s — %s\n", r.id, r.name)
+		for i, r := range rows {
+			if i >= limit {
+				fmt.Fprintf(&b, "...(%d more — use find_devices)\n", len(rows)-limit)
+				break
+			}
+			fmt.Fprintf(&b, "%s — %s\n", r.id, r.name)
+		}
 	}
 	b.WriteString("\nRead any sensor with read_sensor. The house thermostat is climate.house.\n")
+	b.WriteString("For TODAY's energy in kWh (solar produced today, home energy used today, grid import/export today) call energy_today — do NOT use read_sensor for those; the solar_* sensors are instantaneous watts or lifetime totals, not today's kWh.\n")
+	b.WriteString("For PAST/historical values (hottest/coldest/average/how-much/when over today, yesterday, this week, etc.) call query_history, NOT read_sensor. For any HVAC/comfort reasoning (why is it hot upstairs, is the AC keeping up, what is the climate doing) call climate_status.\n")
 	if s.mem != nil {
 		if facts := s.mem.all(); len(facts) > 0 {
 			b.WriteString("\nThings you've been asked to remember (known facts — use them directly, no tool needed to recall):\n")
@@ -226,6 +236,24 @@ func assistantTools() []olTool {
 		{Type: "function", Function: olToolDef{Name: "water_usage",
 			Description: "Get household water usage totals (gallons) for this hour, today, this week, and this month.",
 			Parameters:  obj(map[string]any{})}},
+		{Type: "function", Function: olToolDef{Name: "energy_today",
+			Description: "Get TODAY's energy totals in kWh: solar produced, home used, grid exported, grid imported. Use this for any 'how much solar did we make/produce today', 'energy used today', or grid import/export question.",
+			Parameters:  obj(map[string]any{})}},
+		{Type: "function", Function: olToolDef{Name: "query_history",
+			Description: "Historical/aggregate value of ANY sensor over a PAST window. Use for hottest/coldest/highest/lowest/average/how-much/when questions about the past (e.g. 'hottest upstairs today', 'avg humidity last 24h', 'coldest last night'). For cumulative meters (energy/water) use stat 'delta' = amount used over the window. NOT for current values (use read_sensor).",
+			Parameters: obj(map[string]any{
+				"query":  str("sensor keywords, e.g. 'upstairs temperature' or 'solar pv energy'"),
+				"period": map[string]any{"type": "string", "enum": []string{"last_hour", "today", "yesterday", "last_24h", "last_7d", "last_30d"}},
+				"stat":   map[string]any{"type": "string", "enum": []string{"max", "min", "avg", "last", "delta"}}}, "query", "period", "stat")}},
+		{Type: "function", Function: olToolDef{Name: "climate_status",
+			Description: "Whole-house HVAC snapshot in ONE call: thermostat mode/action/setpoint, upstairs & downstairs temperatures, and climate-brain state. Use for 'why is it hot upstairs', 'is the AC keeping up', 'what is the climate doing', or any heating/cooling reasoning question. This is ONLY the central heating/cooling system — do NOT use it for a named fan, light, switch, lock, or other device; for why/when a specific device changed use recent_events, and for a device's current state use get_state.",
+			Parameters:  obj(map[string]any{})}},
+		{Type: "function", Function: olToolDef{Name: "who_is_home",
+			Description: "Who/what is home: the composite occupancy sensor plus which tracked phones are home vs away. Use for 'is anyone home', 'who's here', 'is everyone out'.",
+			Parameters:  obj(map[string]any{})}},
+		{Type: "function", Function: olToolDef{Name: "recent_events",
+			Description: "Recent state-change history for a device and WHY it changed — which automation, a manual/app action, the assistant, or the device itself. Use for 'why did the X turn off/on', 'when did the X last change', 'what turned off the X', 'did the X run today', or diagnosing any device's recent behavior. Pass the device name or room as query; leave empty for recent whole-house activity. NOT for the heating/cooling system (use climate_status for that).",
+			Parameters:  obj(map[string]any{"query": str("device name or room, e.g. 'family room fan'; empty for all recent activity")})}},
 		{Type: "function", Function: olToolDef{Name: "remember",
 			Description: "Save a durable fact or preference the user asks you to remember (a name, a preference, how they refer to a room). It persists across restarts and future chats.",
 			Parameters:  obj(map[string]any{"fact": str("the fact to remember, as a standalone statement")}, "fact")}},
@@ -245,6 +273,13 @@ func (s *Server) resolveEntity(id string) string {
 	}
 	if _, ok := s.store.Get(id); ok {
 		return id // exact hit
+	}
+	if s.devMap != nil {
+		if mid := s.devMap.resolveByMap(id); mid != "" {
+			if _, ok := s.store.Get(mid); ok {
+				return mid
+			}
+		}
 	}
 	guess := strings.ToLower(id)
 	if i := strings.Index(guess, "."); i >= 0 {
@@ -469,6 +504,16 @@ func (s *Server) execTool(name string, args map[string]any) string {
 		json.NewDecoder(resp.Body).Decode(&u)
 		return fmt.Sprintf("water used — this hour: %.1f gal; today: %.1f gal; this week: %.1f gal; this month: %.1f gal",
 			u.Hour, u.Today, u.Week, u.Month)
+	case "energy_today":
+		return s.energyToday()
+	case "query_history":
+		return s.queryHistory(getStr("query"), getStr("period"), getStr("stat"))
+	case "climate_status":
+		return s.climateStatus()
+	case "who_is_home":
+		return s.whoIsHome()
+	case "recent_events":
+		return s.recentEvents(getStr("query"))
 	case "remember":
 		if s.mem == nil {
 			return "memory unavailable"
@@ -496,6 +541,277 @@ func (s *Server) execTool(name string, args map[string]any) string {
 		return "forgot " + strings.Join(ids, ", ")
 	}
 	return "unknown tool: " + name
+}
+
+// energyToday returns today's kWh totals (solar produced / home used / grid export+import),
+// computed as the delta of the cumulative solar-assistant energy counters from local
+// start-of-day to now (read from the history DB). The solar_* live sensors are only
+// instantaneous watts or lifetime totals, so "how much today" must be derived here.
+func (s *Server) energyToday() string {
+	loc, err := time.LoadLocation("America/Denver")
+	if err != nil {
+		loc = time.Local
+	}
+	now := time.Now().In(loc)
+	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).Unix()
+	counters := []struct{ id, label string }{
+		{"sensor.solar_pv_energy", "solar produced"},
+		{"sensor.solar_load_energy", "home used"},
+		{"sensor.solar_grid_energy_out", "exported to grid"},
+		{"sensor.solar_grid_energy_in", "imported from grid"},
+	}
+	var parts []string
+	for _, c := range counters {
+		if d, ok := s.energyDeltaToday(c.id, midnight); ok {
+			parts = append(parts, fmt.Sprintf("%s %.1f kWh", c.label, d))
+		}
+	}
+	if len(parts) == 0 {
+		return "energy totals unavailable right now"
+	}
+	return "today so far — " + strings.Join(parts, "; ")
+}
+
+// energyDeltaToday returns (now - start-of-day) for a cumulative kWh counter, from history.
+func (s *Server) energyDeltaToday(id string, midnight int64) (float64, bool) {
+	start := midnight - 3600 // grab an hour pre-midnight to find the true start-of-day baseline
+	u := fmt.Sprintf("http://127.0.0.1:8093/api/history/%s?start=%d&resolution=", id, start)
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("X-HF-Internal", s.internalToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+	var h struct {
+		Points []struct {
+			TS  string  `json:"ts"`
+			Val float64 `json:"val"`
+		} `json:"points"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&h) != nil || len(h.Points) == 0 {
+		return 0, false
+	}
+	base := h.Points[0].Val
+	for _, pt := range h.Points { // last point at/before midnight = the value entering the day
+		t, e := time.Parse(time.RFC3339, pt.TS)
+		if e == nil && t.Unix() <= midnight {
+			base = pt.Val
+		} else {
+			break
+		}
+	}
+	d := h.Points[len(h.Points)-1].Val - base
+	if d < 0 {
+		d = 0 // counter reset guard
+	}
+	return d, true
+}
+
+type histPt struct {
+	t int64
+	v float64
+}
+
+// periodWindow returns the [start,end] unix range for a named period (local America/Denver).
+func periodWindow(period string) (int64, int64) {
+	loc, err := time.LoadLocation("America/Denver")
+	if err != nil {
+		loc = time.Local
+	}
+	now := time.Now().In(loc)
+	end := now.Unix()
+	mid := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	switch period {
+	case "last_hour":
+		return now.Add(-time.Hour).Unix(), end
+	case "yesterday":
+		return mid.AddDate(0, 0, -1).Unix(), mid.Unix()
+	case "last_24h":
+		return now.Add(-24 * time.Hour).Unix(), end
+	case "last_7d":
+		return now.AddDate(0, 0, -7).Unix(), end
+	case "last_30d":
+		return now.AddDate(0, 0, -30).Unix(), end
+	default: // today
+		return mid.Unix(), end
+	}
+}
+
+// resolveSensor picks the best-matching sensor id (+ its unit) for free-text keywords,
+// mirroring read_sensor's scoring (climate bonus, noisy-sensor penalties).
+func (s *Server) resolveSensor(query string) (string, string) {
+	q := strings.ToLower(query)
+	words := strings.Fields(q)
+	best, bestUnit, bestScore := "", "", -1000
+	for _, e := range s.store.All() {
+		if !strings.HasPrefix(e.ID, "sensor.") {
+			continue
+		}
+		hay := strings.ToLower(e.ID + " " + e.Name)
+		score := 0
+		for _, w := range words {
+			if strings.Contains(hay, w) {
+				score++
+			}
+		}
+		if score == 0 {
+			continue
+		}
+		if strings.Contains(e.ID, "climate") {
+			score += 2
+		}
+		for _, bad := range []string{"kidde", "uptime", "signal", "rssi", "battery", "eco2", "tvoc", "iaq", "linkquality", "_air_"} {
+			if strings.Contains(e.ID, bad) {
+				score -= 3
+				break
+			}
+		}
+		if score > bestScore {
+			bestScore = score
+			best = e.ID
+			bestUnit, _ = e.Attributes["unit_of_measurement"].(string)
+		}
+	}
+	return best, bestUnit
+}
+
+// fetchHistoryPts pulls a sensor's history points within [start,end] from the internal API.
+func (s *Server) fetchHistoryPts(id string, start, end int64) []histPt {
+	u := fmt.Sprintf("http://127.0.0.1:8093/api/history/%s?start=%d&resolution=", id, start)
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("X-HF-Internal", s.internalToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var h struct {
+		Points []struct {
+			TS  string  `json:"ts"`
+			Val float64 `json:"val"`
+		} `json:"points"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&h) != nil {
+		return nil
+	}
+	var out []histPt
+	for _, p := range h.Points {
+		t, e := time.Parse(time.RFC3339, p.TS)
+		if e != nil {
+			continue
+		}
+		u := t.Unix()
+		if u < start || u > end {
+			continue
+		}
+		out = append(out, histPt{u, p.Val})
+	}
+	return out
+}
+
+// queryHistory computes an aggregate (max/min/avg/last/delta) of a sensor over a period.
+func (s *Server) queryHistory(query, period, stat string) string {
+	id, unit := s.resolveSensor(query)
+	if id == "" {
+		return "no sensor matched: " + query
+	}
+	start, end := periodWindow(period)
+	pts := s.fetchHistoryPts(id, start, end)
+	if len(pts) == 0 {
+		return "no history for " + id + " over " + period
+	}
+	var res float64
+	switch stat {
+	case "min":
+		res = pts[0].v
+		for _, p := range pts {
+			if p.v < res {
+				res = p.v
+			}
+		}
+	case "avg":
+		sum := 0.0
+		for _, p := range pts {
+			sum += p.v
+		}
+		res = sum / float64(len(pts))
+	case "last":
+		res = pts[len(pts)-1].v
+	case "delta":
+		res = pts[len(pts)-1].v - pts[0].v
+		if res < 0 {
+			res = 0
+		}
+	default: // max
+		res = pts[0].v
+		for _, p := range pts {
+			if p.v > res {
+				res = p.v
+			}
+		}
+	}
+	return fmt.Sprintf("%s over %s: %s", stat, period, sensorReading(id, fmt.Sprintf("%.2f", res), unit))
+}
+
+// climateStatus returns a one-call HVAC snapshot for reasoning questions.
+func (s *Server) climateStatus() string {
+	var parts []string
+	if e, ok := s.store.Get("climate.house"); ok {
+		a := e.Attributes
+		parts = append(parts, fmt.Sprintf("thermostat: mode=%s action=%v setpoint=%v house=%v",
+			e.State, a["hvac_action"], a["temperature"], a["current_temperature"]))
+	}
+	for _, z := range []struct{ id, label string }{
+		{"sensor.upstairs_temp_climate_temperature", "upstairs"},
+		{"sensor.downstairs_temp_climate_temperature", "downstairs"},
+	} {
+		if e, ok := s.store.Get(z.id); ok {
+			unit, _ := e.Attributes["unit_of_measurement"].(string)
+			parts = append(parts, z.label+" "+sensorReading(z.id, e.State, unit))
+		}
+	}
+	for _, k := range []struct{ id, label string }{
+		{"sensor.climatebrain_status", "brain"},
+		{"sensor.climatebrain_feels_upstairs", "feels-up"},
+		{"sensor.climatebrain_feels_downstairs", "feels-down"},
+	} {
+		if e, ok := s.store.Get(k.id); ok && strings.TrimSpace(e.State) != "" {
+			parts = append(parts, k.label+"="+e.State)
+		}
+	}
+	if len(parts) == 0 {
+		return "climate status unavailable"
+	}
+	return strings.Join(parts, " | ")
+}
+
+// whoIsHome summarizes presence: the composite occupancy sensor + tracked phones home/away.
+func (s *Server) whoIsHome() string {
+	occ := "unknown"
+	if e, ok := s.store.Get("binary_sensor.home_occupied"); ok {
+		occ = e.State
+	}
+	var home, away []string
+	for _, e := range s.store.All() {
+		if !strings.HasPrefix(e.ID, "device_tracker.") {
+			continue
+		}
+		name := strings.TrimPrefix(e.ID, "device_tracker.")
+		if e.State == "home" {
+			home = append(home, name)
+		} else {
+			away = append(away, name)
+		}
+	}
+	r := "house occupied: " + occ
+	if len(home) > 0 {
+		r += "; phones home: " + strings.Join(home, ", ")
+	}
+	if len(away) > 0 {
+		r += "; phones away: " + strings.Join(away, ", ")
+	}
+	return r
 }
 
 func (s *Server) ollamaChat(messages []olMessage, tools []olTool) (olMessage, error) {

@@ -44,11 +44,14 @@ var upgrader = websocket.Upgrader{
 type Server struct {
 	cfg           config.APIConfig
 	assistantCfg  config.AssistantConfig
+	devMap        *deviceMapData // per-home semantic map (optional; nil => raw dump)
+	logbook       *logbook       // device state-change log w/ cause attribution
 	camerasCfg    config.CamerasConfig
 	nvrProxy      *httputil.ReverseProxy
 	mem           *assistantMemory
 	auth          *authStore
 	internalToken string
+	matrix        *matrixController
 	store         *entity.Store
 	bus           *bus.Bus
 	homeLat       float64 // home zone centre (from integrations.weather) for presence
@@ -66,7 +69,7 @@ type Server struct {
 	autoState   *automation.StateStore
 
 	mu      sync.RWMutex
-	clients map[*websocket.Conn]struct{}
+	clients map[*websocket.Conn]*userScope // per-connection scope; nil = unrestricted (owner)
 
 	writeMu sync.Mutex // serialises all websocket writes; gorilla panics on concurrent writes to a conn
 }
@@ -76,7 +79,7 @@ func NewServer(cfg config.APIConfig, store *entity.Store, b *bus.Bus) *Server {
 		cfg:     cfg,
 		store:   store,
 		bus:     b,
-		clients: make(map[*websocket.Conn]struct{}),
+		clients: make(map[*websocket.Conn]*userScope),
 	}
 
 	// Health entities come from an infrequent source (phone, every ~12h), so unlike other
@@ -85,17 +88,37 @@ func NewServer(cfg config.APIConfig, store *entity.Store, b *bus.Bus) *Server {
 	s.loadHealthSnapshot()
 
 	// Broadcast every state change to all WebSocket clients.
+	s.logbook = newLogbook(logbookPath)
 	b.Subscribe(entity.TopicStateChanged, func(ev bus.Event) {
 		payload, ok := ev.Payload.(entity.StateChangedPayload)
 		if !ok {
 			return
 		}
+		s.logbook.noteState(payload.Entity)
 		msg, _ := json.Marshal(map[string]any{
 			"type":   "state_changed",
 			"entity": payload.Entity,
 		})
-		s.broadcast(msg)
+		s.broadcastEntity(payload.Entity.ID, msg)
 	})
+	b.Subscribe("service.call", func(ev bus.Event) {
+		m, ok := ev.Payload.(map[string]any)
+		if !ok {
+			return
+		}
+		eid, _ := m["entity"].(string)
+		cause, _ := m["cause"].(string)
+		if cause == "" {
+			cause, _ = m["source"].(string)
+		}
+		if cause == "" {
+			cause = "unknown"
+		}
+		s.logbook.noteCommand(eid, cause)
+	})
+
+	// D1 Matrix control plane (Victor's LED panel). Resumes any saved custom scene.
+	s.matrix = newMatrixController(matrixDefaultIP)
 
 	return s
 }
@@ -407,6 +430,9 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /api/entities/{id}", s.handleEntity)
 	mux.HandleFunc("POST /api/services/{domain}/{service}", s.handleServiceCall)
 	mux.HandleFunc("GET /api/ws", s.handleWebSocket)
+	mux.HandleFunc("GET /aiterm", s.handleAITermPage)
+	mux.HandleFunc("GET /api/aiterm/ws", s.handleAITermWS)
+	mux.HandleFunc("/api/mcp", s.handleMCP)
 	mux.HandleFunc("POST /api/reload", s.handleReload)
 	mux.HandleFunc("POST /api/devices/{name}/restart", s.handleDeviceRestart)
 	mux.HandleFunc("POST /api/devices/{name}/ota_prep", s.handleDeviceOtaPrep)
@@ -432,6 +458,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/assistant", s.handleAssistant)
 	mux.HandleFunc("POST /api/assistant/stt", s.handleSTT)
 	mux.HandleFunc("POST /api/assistant/tts", s.handleTTS)
+	mux.HandleFunc("GET /api/ai/activity", s.handleAIActivity)
 	mux.HandleFunc("GET /api/cameras", s.handleCamerasList)
 	mux.HandleFunc("GET /api/cameras/{name}/frame", s.handleCameraFrame)
 	mux.HandleFunc("GET /api/events", s.handleEventsList)
@@ -450,6 +477,20 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/mobile/sensors", s.handleMobileSensors)
 	mux.HandleFunc("GET /api/mobile/config", s.handleMobileConfig)
 	mux.HandleFunc("POST /api/mobile/config", s.handleMobileConfigSet)
+	mux.HandleFunc("GET /api/matrix/status", s.handleMatrixStatus)
+	mux.HandleFunc("GET /api/matrix/scenes", s.handleMatrixScenes)
+	mux.HandleFunc("POST /api/matrix/scene", s.handleMatrixScene)
+	mux.HandleFunc("POST /api/matrix/apply", s.handleMatrixApply)
+	mux.HandleFunc("POST /api/matrix/test", s.handleMatrixTest)
+	mux.HandleFunc("POST /api/matrix/stop", s.handleMatrixStop)
+	mux.HandleFunc("POST /api/matrix/generate", s.handleMatrixGenerate)
+	mux.HandleFunc("POST /api/matrix/surprise", s.handleMatrixSurprise)
+	mux.HandleFunc("GET /api/matrix/usage", s.handleMatrixUsage)
+	mux.HandleFunc("GET /api/matrix/history", s.handleMatrixHistory)
+	mux.HandleFunc("GET /aihistory", s.handleAiHistoryPage)
+	mux.HandleFunc("GET /download", s.handleDownloadPage)
+	mux.HandleFunc("GET /download/homeforge.apk", s.handleAppDownload)
+	mux.HandleFunc("GET /download/latest.json", s.handleAppManifest)
 	mux.HandleFunc("GET /api/auth/users", s.handleListUsers)
 	mux.HandleFunc("POST /api/auth/users", s.handleAddUser)
 	mux.HandleFunc("DELETE /api/auth/users/{email}", s.handleDeleteUser)
@@ -970,11 +1011,27 @@ func triggerSummary(t config.TriggerConfig) string {
 
 func (s *Server) handleEntities(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(s.store.All())
+	sc := s.scopeFor(r)
+	if sc == nil {
+		json.NewEncoder(w).Encode(s.store.All())
+		return
+	}
+	all := s.store.All()
+	out := make([]entity.Entity, 0, len(all))
+	for _, e := range all {
+		if sc.allows(e.ID) {
+			out = append(out, e)
+		}
+	}
+	json.NewEncoder(w).Encode(out)
 }
 
 func (s *Server) handleEntity(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !s.scopeFor(r).allows(id) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
 	e, ok := s.store.Get(id)
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -1113,6 +1170,12 @@ func (s *Server) handleServiceCall(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&body)
 
 	entityID, _ := body["entity_id"].(string)
+	// A scoped account (e.g. a kid locked to one room) may only control entities it can see —
+	// hidden must also mean blocked, so reject control of anything outside its allow-set.
+	if sc := s.scopeFor(r); entityID != "" && !sc.allows(entityID) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	data, _ := body["data"].(map[string]any)
 
 	s.bus.Publish("service.call", map[string]any{
@@ -1126,6 +1189,10 @@ func (s *Server) handleServiceCall(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Resolve the account's scope BEFORE the upgrade — after Upgrade the request is hijacked and
+	// the session cookie is no longer readable.
+	sc := s.scopeFor(r)
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -1133,7 +1200,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	s.mu.Lock()
-	s.clients[conn] = struct{}{}
+	s.clients[conn] = sc
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -1141,10 +1208,20 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}()
 
-	// Send current state snapshot on connect.
+	// Send current state snapshot on connect (scoped for restricted accounts).
+	ents := s.store.All()
+	if sc != nil {
+		filtered := make([]entity.Entity, 0, len(ents))
+		for _, e := range ents {
+			if sc.allows(e.ID) {
+				filtered = append(filtered, e)
+			}
+		}
+		ents = filtered
+	}
 	snapshot, _ := json.Marshal(map[string]any{
 		"type":     "snapshot",
-		"entities": s.store.All(),
+		"entities": ents,
 	})
 	s.writeConn(conn, snapshot)
 
@@ -1181,6 +1258,27 @@ func (s *Server) broadcast(msg []byte) {
 	}
 }
 
+// broadcastEntity sends msg only to clients whose scope permits entityID. Scoped accounts (e.g. a
+// kid locked to one room) never receive live updates for entities they can't see. Unrestricted
+// clients (nil scope) receive everything — allows() returns true on a nil receiver.
+func (s *Server) broadcastEntity(entityID string, msg []byte) {
+	type target struct {
+		conn *websocket.Conn
+		sc   *userScope
+	}
+	s.mu.RLock()
+	targets := make([]target, 0, len(s.clients))
+	for conn, sc := range s.clients {
+		targets = append(targets, target{conn, sc})
+	}
+	s.mu.RUnlock()
+	for _, t := range targets {
+		if t.sc.allows(entityID) {
+			s.writeConn(t.conn, msg)
+		}
+	}
+}
+
 // spaHandler serves static files and falls back to index.html for unknown paths
 // so SvelteKit client-side routing works correctly.
 func spaHandler(fsys fs.FS) http.Handler {
@@ -1207,6 +1305,11 @@ const floorplanPath = "/data/floorplan.json"
 
 func (s *Server) handleFloorplanGet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	// The floor-plan is a whole-house map (owner-only feature); scoped accounts don't get it.
+	if s.scopeFor(r) != nil {
+		w.Write([]byte("{}"))
+		return
+	}
 	data, err := os.ReadFile(floorplanPath)
 	if err != nil {
 		w.Write([]byte("{}"))

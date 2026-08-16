@@ -77,13 +77,13 @@ type APIConfig struct {
 }
 
 type MQTTConfig struct {
-	External       bool                 `yaml:"external"`
-	Host           string               `yaml:"host"`
-	Port           int                  `yaml:"port"`
-	Username       string               `yaml:"username"`
-	Password       string               `yaml:"password"`
-	NtfyURL        string               `yaml:"ntfy_url"`       // ntfy topic URL for push alerts, e.g. https://ntfy.sh/<topic>
-	PushRelayURL   string               `yaml:"push_relay_url"` // FCM push-relay URL; empty = shared default (push.DefaultRelayURL)
+	External     bool        `yaml:"external"`
+	Host         string      `yaml:"host"`
+	Port         int         `yaml:"port"`
+	Username     string      `yaml:"username"`
+	Password     string      `yaml:"password"`
+	NtfyURL        string               `yaml:"ntfy_url"`        // ntfy topic URL for push alerts, e.g. https://ntfy.sh/<topic>
+	PushRelayURL   string               `yaml:"push_relay_url"`  // FCM push-relay URL; empty = shared default (push.DefaultRelayURL)
 	ZwaveLocks     []ZwaveLock          `yaml:"zwave_locks"`
 	SentinelNotify []SentinelNotifyRule `yaml:"sentinel_notify"` // tap-to-clip pushes on Sentinel detections
 }

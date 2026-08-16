@@ -1,14 +1,29 @@
 <script lang="ts">
-  import { tick } from 'svelte'
+  import { tick, onMount } from 'svelte'
 
-  type Msg = { role: 'user' | 'assistant'; content: string; actions?: string[] }
+  // ─────────── AI hub: one place, three modes ───────────
+  type Mode = 'ask' | 'create' | 'terminal'
+  let mode = $state<Mode>('ask')
+  let isOwner = $state(false)
+  let termSrc = $state('/aiterm')
+  let termLoaded = $state(false)
+
+  onMount(async () => {
+    try {
+      const d = await (await fetch('/api/auth/me')).json()
+      isOwner = !!d.authenticated && !!d.email && d.email === d.ownerEmail
+    } catch {}
+  })
+
+  // ═══════════ ASK (local model chat) ═══════════
+  type Msg = { role: 'user' | 'assistant'; content: string; actions?: string[]; source?: string }
   let msgs = $state<Msg[]>([])
   let input = $state('')
   let busy = $state(false)
   let scroller: HTMLDivElement
   let ta: HTMLTextAreaElement
+  let lastUser = $state('')
 
-  // grow the textarea with its content (wrap instead of scrolling right), up to a max then scroll
   function autoGrow() {
     if (!ta) return
     ta.style.height = 'auto'
@@ -17,15 +32,13 @@
 
   // ── voice ──
   let recording = $state(false)
-  let voiceOn = $state(false) // speak replies aloud
+  let voiceOn = $state(false)
   let recorder: MediaRecorder | null = null
   let chunks: Blob[] = []
   let audioCtx: AudioContext | null = null
   let vadRAF = 0
   let player: HTMLAudioElement | null = null
 
-  // Neural voice via the local Piper service; falls back to the browser voice if it's down.
-  // Playback works over plain HTTP (only mic capture needs HTTPS/localhost).
   async function speak(text: string) {
     if (!text) return
     try {
@@ -51,15 +64,12 @@
   function stopRecording() {
     if (recorder && recorder.state !== 'inactive') recorder.stop()
   }
-
   function cleanupVAD() {
     if (vadRAF) cancelAnimationFrame(vadRAF)
     vadRAF = 0
     audioCtx?.close().catch(() => {})
     audioCtx = null
   }
-
-  // Voice-activity detection: auto-stop ~1.2s after you go quiet (once you've spoken), 15s cap.
   function startVAD(stream: MediaStream) {
     audioCtx = new AudioContext()
     const analyser = audioCtx.createAnalyser()
@@ -70,7 +80,7 @@
     let spoke = false
     let quietSince = start
     const THRESH = 0.02, SILENCE_MS = 1200, MAX_MS = 15000, MIN_MS = 500
-    const tick = () => {
+    const tick2 = () => {
       if (!recording || !audioCtx) return
       analyser.getByteTimeDomainData(buf)
       let sum = 0
@@ -80,11 +90,10 @@
       if (rms > THRESH) { spoke = true; quietSince = now }
       if (spoke && now - start > MIN_MS && now - quietSince > SILENCE_MS) return stopRecording()
       if (now - start > MAX_MS) return stopRecording()
-      vadRAF = requestAnimationFrame(tick)
+      vadRAF = requestAnimationFrame(tick2)
     }
-    vadRAF = requestAnimationFrame(tick)
+    vadRAF = requestAnimationFrame(tick2)
   }
-
   async function toggleMic() {
     if (recording) { stopRecording(); return }
     try {
@@ -103,7 +112,7 @@
           const res = await fetch('/api/assistant/stt', { method: 'POST', body: blob })
           const { text } = await res.json()
           busy = false
-          if (text?.trim()) await send(text, true) // voice in → speak the reply back
+          if (text?.trim()) await send(text, true)
           else msgs.push({ role: 'assistant', content: "(I didn't catch that — try again)" })
         } catch {
           busy = false
@@ -112,7 +121,7 @@
       }
       recorder.start()
       recording = true
-      voiceOn = true // asking by voice implies you want to hear the answer
+      voiceOn = true
       startVAD(stream)
     } catch {
       msgs.push({ role: 'assistant', content: '⚠️ Microphone access was denied or is unavailable.' })
@@ -135,14 +144,12 @@
     const message = text.trim()
     if (!message || busy) return
     input = ''
-    if (ta) ta.style.height = 'auto' // shrink back after sending
+    lastUser = message
+    if (ta) ta.style.height = 'auto'
     msgs.push({ role: 'user', content: message })
     busy = true
     scrollDown()
-    // pass prior turns (role+content only) as conversation history
-    const history = msgs
-      .slice(0, -1)
-      .map((m) => ({ role: m.role, content: m.content }))
+    const history = msgs.slice(0, -1).map((m) => ({ role: m.role, content: m.content }))
     try {
       const res = await fetch('/api/assistant', {
         method: 'POST',
@@ -150,7 +157,7 @@
         body: JSON.stringify({ message, history }),
       })
       const data = await res.json()
-      msgs.push({ role: 'assistant', content: data.reply ?? '(no reply)', actions: data.actions ?? [] })
+      msgs.push({ role: 'assistant', content: data.reply ?? '(no reply)', actions: data.actions ?? [], source: 'local' })
       if (spoken || voiceOn) speak(data.reply ?? '')
     } catch (e) {
       msgs.push({ role: 'assistant', content: '⚠️ Could not reach the assistant. Is the local model running?' })
@@ -161,108 +168,189 @@
   }
 
   function onKey(e: KeyboardEvent) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      send(input)
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(input) }
   }
+
+  // ═══════════ escalate → Terminal (subscription) ═══════════
+  function askClaude(q?: string) {
+    const t = (q ?? input ?? '').trim() || lastUser
+    if (!isOwner) return // Terminal is owner-gated
+    termSrc = t ? '/aiterm?q=' + encodeURIComponent(t) : '/aiterm'
+    termLoaded = true
+    mode = 'terminal'
+  }
+
+  // ═══════════ CREATE (LED scenes — subscription-backed) ═══════════
+  let scenePrompt = $state('')
+  let sceneBusy = $state(false)
+  let sceneDeluxe = $state(false)
+  let sceneMsg = $state('')
+  const sceneChips = ['a calm ocean sunset', 'minecraft world', 'a cozy campfire', 'northern lights', 'lava volcano']
+
+  async function genScene(p?: string) {
+    const prompt = (p ?? scenePrompt).trim()
+    if (!prompt || sceneBusy) return
+    scenePrompt = prompt
+    sceneBusy = true
+    sceneMsg = sceneDeluxe ? 'Designing with Claude…' : 'Designing locally…'
+    try {
+      const r = await fetch('/api/matrix/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, deluxe: sceneDeluxe }),
+      })
+      const d = await r.json()
+      sceneMsg = d.ok ? `✓ ${d.source}: ${d.applied} — ${d.result}` : `⚠ ${d.note || 'could not generate'}`
+    } catch { sceneMsg = '⚠ could not reach the scene generator' }
+    finally { sceneBusy = false }
+  }
+  async function surprise() {
+    if (sceneBusy) return
+    sceneBusy = true
+    sceneMsg = 'Surprising…'
+    try {
+      const d = await (await fetch('/api/matrix/surprise', { method: 'POST' })).json()
+      sceneMsg = d.ok ? `✓ surprise — ${d.result || 'new scene'}` : `⚠ ${d.note || 'failed'}`
+    } catch { sceneMsg = '⚠ could not reach the scene generator' }
+    finally { sceneBusy = false }
+  }
+
+  const modes = $derived<[Mode, string, string][]>(
+    isOwner
+      ? [['ask', 'Ask', '💬'], ['create', 'Create', '✦'], ['terminal', 'Terminal', '⌘']]
+      : [['ask', 'Ask', '💬'], ['create', 'Create', '✦']]
+  )
 </script>
 
-<svelte:head><title>HomeForge · Assistant</title></svelte:head>
+<svelte:head><title>HomeForge · AI</title></svelte:head>
 
-<div class="mx-auto flex flex-col" style="max-width: 820px; height: calc(100vh - 8rem)">
-  <div class="mb-3 flex items-start justify-between gap-3">
-    <div>
-      <h1 class="text-xl font-bold" style="color: var(--text)">🤖 Home Assistant</h1>
-      <p class="text-sm" style="color: var(--text-muted)">
-        Local AI — runs entirely on your server. Type or tap the mic to talk.
-      </p>
+<div class="mx-auto flex flex-col" style="max-width: 900px; height: calc(100vh - 8rem)">
+  <!-- header + mode switcher -->
+  <div class="mb-3 flex items-center justify-between gap-3 flex-wrap">
+    <h1 class="text-xl font-bold" style="color: var(--text)">🤖 HomeForge AI</h1>
+    <div class="flex gap-1 p-1 rounded-lg" style="background: var(--surface-2)">
+      {#each modes as [m, label, icon]}
+        <button
+          onclick={() => (mode = m)}
+          class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors"
+          style="color: {mode === m ? '#fff' : 'var(--text-muted)'};
+                 background: {mode === m ? 'var(--accent)' : 'transparent'}"
+        >{icon} {label}</button>
+      {/each}
     </div>
-    <button
-      onclick={() => (voiceOn = !voiceOn)}
-      title="Speak replies aloud"
-      class="shrink-0 text-xs px-2.5 py-1.5 rounded-md border transition-colors"
-      style="border-color: var(--border); color: var(--text); background: {voiceOn ? 'var(--surface-2)' : 'transparent'}"
-    >{voiceOn ? '🔊 Speaking' : '🔇 Muted'}</button>
   </div>
 
-  <div
-    bind:this={scroller}
-    class="flex-1 overflow-y-auto rounded-lg border p-4 flex flex-col gap-3"
-    style="border-color: var(--border); background: var(--surface)"
-  >
-    {#if msgs.length === 0}
-      <div class="m-auto text-center" style="color: var(--text-muted)">
-        <div class="text-4xl mb-3">💬</div>
-        <div class="text-sm mb-4">Try one of these:</div>
-        <div class="flex flex-wrap gap-2 justify-center" style="max-width: 520px">
-          {#each examples as ex}
-            <button
-              onclick={() => send(ex)}
-              class="px-3 py-1.5 rounded-full text-sm border transition-colors"
-              style="border-color: var(--border); color: var(--text); background: var(--surface-2)"
-            >{ex}</button>
-          {/each}
-        </div>
-      </div>
-    {/if}
+  {#if mode === 'ask'}
+    <p class="text-xs mb-2" style="color: var(--text-muted)">
+      Local AI — runs entirely on your server, fast &amp; private.
+      {#if isOwner}Need deeper reasoning? Tap <b style="color: var(--accent)">⚡ Claude</b>.{/if}
+    </p>
 
-    {#each msgs as m}
-      <div class="flex {m.role === 'user' ? 'justify-end' : 'justify-start'}">
-        <div
-          class="rounded-2xl px-4 py-2.5 text-sm leading-relaxed"
-          style="max-width: 80%; white-space: pre-wrap;
-                 background: {m.role === 'user' ? 'var(--accent)' : 'var(--surface-2)'};
-                 color: {m.role === 'user' ? '#fff' : 'var(--text)'}"
-        >
-          {m.content}
-          {#if m.actions && m.actions.length}
-            <div class="mt-1.5 flex flex-wrap gap-1">
-              {#each m.actions as a}
-                <span
-                  class="px-1.5 py-0.5 rounded text-xs font-mono"
-                  style="background: var(--surface); color: var(--text-muted)"
-                >⚙ {a}</span>
-              {/each}
+    <div bind:this={scroller} class="flex-1 overflow-y-auto rounded-lg border p-4 flex flex-col gap-3"
+      style="border-color: var(--border); background: var(--surface)">
+      {#if msgs.length === 0}
+        <div class="m-auto text-center" style="color: var(--text-muted)">
+          <div class="text-4xl mb-3">💬</div>
+          <div class="text-sm mb-4">Try one of these:</div>
+          <div class="flex flex-wrap gap-2 justify-center" style="max-width: 520px">
+            {#each examples as ex}
+              <button onclick={() => send(ex)}
+                class="px-3 py-1.5 rounded-full text-sm border transition-colors"
+                style="border-color: var(--border); color: var(--text); background: var(--surface-2)">{ex}</button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      {#each msgs as m}
+        <div class="flex {m.role === 'user' ? 'justify-end' : 'justify-start'}">
+          <div class="flex flex-col gap-1" style="max-width: 82%">
+            <div class="rounded-2xl px-4 py-2.5 text-sm leading-relaxed" style="white-space: pre-wrap;
+                   background: {m.role === 'user' ? 'var(--accent)' : 'var(--surface-2)'};
+                   color: {m.role === 'user' ? '#fff' : 'var(--text)'}">
+              {m.content}
+              {#if m.actions && m.actions.length}
+                <div class="mt-1.5 flex flex-wrap gap-1">
+                  {#each m.actions as a}
+                    <span class="px-1.5 py-0.5 rounded text-xs font-mono" style="background: var(--surface); color: var(--text-muted)">⚙ {a}</span>
+                  {/each}
+                </div>
+              {/if}
             </div>
-          {/if}
+            {#if m.role === 'assistant' && m.source}
+              <div class="flex items-center gap-2 px-1">
+                <span class="text-xs font-mono" style="color: var(--text-muted)">◍ Local 1.5B</span>
+                {#if isOwner}
+                  <button onclick={() => askClaude(lastUser)} class="text-xs" style="color: var(--accent); background: transparent; border: none; cursor: pointer">⚡ Ask Claude →</button>
+                {/if}
+              </div>
+            {/if}
+          </div>
         </div>
-      </div>
-    {/each}
+      {/each}
 
-    {#if busy}
-      <div class="flex justify-start">
-        <div class="rounded-2xl px-4 py-2.5 text-sm" style="background: var(--surface-2); color: var(--text-muted)">
-          thinking…
+      {#if busy}
+        <div class="flex justify-start">
+          <div class="rounded-2xl px-4 py-2.5 text-sm" style="background: var(--surface-2); color: var(--text-muted)">thinking…</div>
         </div>
-      </div>
-    {/if}
-  </div>
+      {/if}
+    </div>
 
-  <div class="mt-3 flex gap-2 items-end">
-    <button
-      onclick={toggleMic}
-      disabled={busy && !recording}
-      title="Tap to talk"
-      class="shrink-0 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors"
-      style="background: {recording ? '#e5484d' : 'var(--surface-2)'}; color: {recording ? '#fff' : 'var(--text)'}"
-    >{recording ? '● Listening' : '🎤'}</button>
-    <textarea
-      bind:this={ta}
-      bind:value={input}
-      onkeydown={onKey}
-      oninput={autoGrow}
-      rows="1"
-      placeholder="Ask or command…  (Enter to send, Shift+Enter for a new line)"
-      disabled={busy}
-      class="flex-1 rounded-lg border px-4 py-2.5 text-sm outline-none resize-none leading-relaxed"
-      style="border-color: var(--border); background: var(--surface); color: var(--text); max-height: 160px; overflow-y: auto"
-    ></textarea>
-    <button
-      onclick={() => send(input)}
-      disabled={busy || !input.trim()}
-      class="px-5 py-2.5 rounded-lg text-sm font-medium transition-opacity"
-      style="background: var(--accent); color: #fff; opacity: {busy || !input.trim() ? 0.5 : 1}"
-    >Send</button>
-  </div>
+    <div class="mt-3 flex gap-2 items-end">
+      <button onclick={toggleMic} disabled={busy && !recording} title="Tap to talk"
+        class="shrink-0 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors"
+        style="background: {recording ? '#e5484d' : 'var(--surface-2)'}; color: {recording ? '#fff' : 'var(--text)'}">{recording ? '● Listening' : '🎤'}</button>
+      <textarea bind:this={ta} bind:value={input} onkeydown={onKey} oninput={autoGrow} rows="1"
+        placeholder="Ask or command…  (Enter to send, Shift+Enter = new line)" disabled={busy}
+        class="flex-1 rounded-lg border px-4 py-2.5 text-sm outline-none resize-none leading-relaxed"
+        style="border-color: var(--border); background: var(--surface); color: var(--text); max-height: 160px; overflow-y: auto"></textarea>
+      {#if isOwner}
+        <button onclick={() => askClaude()} title="Ask your Claude subscription (deep reasoning)"
+          class="shrink-0 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors"
+          style="background: transparent; color: var(--accent); border: 1px solid var(--accent)">⚡ Claude</button>
+      {/if}
+      <button onclick={() => send(input)} disabled={busy || !input.trim()}
+        class="px-5 py-2.5 rounded-lg text-sm font-medium transition-opacity"
+        style="background: var(--accent); color: #fff; opacity: {busy || !input.trim() ? 0.5 : 1}">Send</button>
+    </div>
+
+  {:else if mode === 'create'}
+    <p class="text-xs mb-3" style="color: var(--text-muted)">
+      Design a scene for the LED matrix. Simple ideas render <b>locally &amp; free</b>; tick
+      <b style="color: var(--accent)">Deluxe</b> to use your <b>subscription</b> (no API key) for richer scenes.
+    </p>
+    <div class="rounded-lg border p-5 flex flex-col gap-4" style="border-color: var(--border); background: var(--surface)">
+      <div class="flex gap-2 items-center flex-wrap">
+        <input bind:value={scenePrompt} onkeydown={(e) => e.key === 'Enter' && genScene()}
+          placeholder="Describe a scene… e.g. a calm ocean sunset"
+          class="flex-1 rounded-lg border px-4 py-2.5 text-sm outline-none" style="min-width: 220px; border-color: var(--border); background: var(--surface-2); color: var(--text)" />
+        <button onclick={() => genScene()} disabled={sceneBusy || !scenePrompt.trim()}
+          class="px-5 py-2.5 rounded-lg text-sm font-medium" style="background: var(--accent); color: #fff; opacity: {sceneBusy || !scenePrompt.trim() ? 0.5 : 1}">✦ Make</button>
+        <button onclick={surprise} disabled={sceneBusy}
+          class="px-4 py-2.5 rounded-lg text-sm font-medium" style="background: var(--surface-2); color: var(--text); border: 1px solid var(--border)">🎲 Surprise</button>
+      </div>
+      <label class="flex items-center gap-2 text-sm" style="color: var(--text-muted)">
+        <input type="checkbox" bind:checked={sceneDeluxe} /> Deluxe (Claude subscription)
+      </label>
+      <div class="flex flex-wrap gap-2">
+        {#each sceneChips as c}
+          <button onclick={() => genScene(c)} disabled={sceneBusy}
+            class="px-3 py-1.5 rounded-full text-sm border" style="border-color: var(--border); color: var(--text); background: var(--surface-2)">{c}</button>
+        {/each}
+      </div>
+      {#if sceneMsg}
+        <div class="text-sm rounded-lg px-3 py-2" style="background: var(--surface-2); color: var(--text)">{sceneMsg}</div>
+      {/if}
+    </div>
+
+  {:else}
+    <p class="text-xs mb-2" style="color: var(--text-muted)">
+      Full agent session on your <b>subscription</b> — reads &amp; controls the whole house via HomeForge tools. You type; owner-gated; every action logged.
+    </p>
+    <div class="flex-1 rounded-lg overflow-hidden border" style="border-color: var(--border); background: #0b1220">
+      {#if termLoaded || mode === 'terminal'}
+        <iframe title="AI Terminal" src={termSrc} style="width:100%; height:100%; border:0; display:block"></iframe>
+      {/if}
+    </div>
+  {/if}
 </div>

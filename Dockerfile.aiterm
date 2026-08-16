@@ -1,0 +1,32 @@
+# HomeForge AI Terminal sidecar: a glibc (Debian) box with node + the AI CLIs and a tiny
+# PTY<->websocket bridge (aitermd). HomeForge proxies its gated terminal websocket here.
+# Owner-level by design (full house + admin-API reach); limits are enforced in software
+# (HF owner gate + CLI tool-allowlist/permission prompts + audit log), not by walling off access.
+
+# --- build the PTY bridge from the homeforge module (already has creack/pty + gorilla/ws) ---
+FROM golang:1.23-bookworm AS builder
+WORKDIR /build
+COPY go.mod ./
+RUN go mod download || true
+COPY . .
+RUN go mod tidy
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /aitermd ./cmd/aitermd
+
+# --- runtime: node + AI CLIs ---
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates git curl jq ripgrep less tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# AI CLIs: Claude Code is primary (verified). Codex + Gemini are best-effort so the terminal
+# "supports all subscriptions" — a failed optional install must not break the image build.
+RUN npm i -g @anthropic-ai/claude-code \
+    && (npm i -g @openai/codex || echo "codex optional-install skipped") \
+    && (npm i -g @google/gemini-cli || echo "gemini optional-install skipped")
+
+COPY --from=builder /aitermd /usr/local/bin/aitermd
+COPY aiterm-entrypoint.sh /usr/local/bin/aiterm-entrypoint.sh
+RUN chmod +x /usr/local/bin/aiterm-entrypoint.sh
+
+ENV AITERM_ADDR=127.0.0.1:7799
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/aiterm-entrypoint.sh"]

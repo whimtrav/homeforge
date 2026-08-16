@@ -327,4 +327,13 @@
   .fp-pin { cursor: grab; }
   .fp-pin:active { cursor: grabbing; }
   .fp-ghost { position: fixed; pointer-events: none; z-index: 50; background: var(--surface-2); border: 1px solid var(--accent); border-radius: 9px; padding: 6px 10px; font-size: 12.5px; color: var(--text); display: flex; gap: 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4); }
+
+  /* Mobile: the side-by-side tray+map overflows a phone. Stack them — a scrollable
+     device tray above a full-width map with a tall min-height so it stays usable. */
+  @media (max-width: 640px) {
+    .fp-wrap { flex-direction: column; height: auto; gap: 10px; }
+    .fp-tray { width: 100%; flex-shrink: 1; max-height: 34vh; }
+    .fp-map  { width: 100%; }
+    .fp-svg  { flex: none; min-height: 68vh; }
+  }
 </style>

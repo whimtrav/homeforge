@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/whimtrav/homeforge/internal/bus"
@@ -17,6 +18,9 @@ type Engine struct {
 	bus         *bus.Bus
 	state       *StateStore // per-automation enabled/disabled overrides (nil = all enabled)
 	lat, lon    float64     // site location for sun (sunrise/sunset) triggers
+
+	mu      sync.Mutex                    // guards `running`
+	running map[string]context.CancelFunc // per-automation in-flight run (for retrigger-reset)
 }
 
 func NewEngine(automations []config.AutomationConfig, store *entity.Store, b *bus.Bus, state *StateStore, lat, lon float64) *Engine {
@@ -27,6 +31,7 @@ func NewEngine(automations []config.AutomationConfig, store *entity.Store, b *bu
 		state:       state,
 		lat:         lat,
 		lon:         lon,
+		running:     map[string]context.CancelFunc{},
 	}
 }
 
@@ -51,7 +56,19 @@ func (e *Engine) Run(ctx context.Context) {
 				continue
 			}
 			slog.Info("automation triggered", "name", a.Name, "entity", payload.Entity.ID, "state", payload.Entity.State)
-			go e.runActions(ctx, a.Action)
+			// Retrigger-reset: cancel any still-pending run of THIS automation and
+			// start fresh, so a `wait`-based grace (motion-clear hold) resets on new
+			// activity instead of stacking uncancellable countdowns where the oldest
+			// wins and drops the light early. New motion/clear now extends the hold.
+			name, actions := a.Name, a.Action
+			e.mu.Lock()
+			if prev, ok := e.running[name]; ok {
+				prev()
+			}
+			runCtx, cancel := context.WithCancel(ctx)
+			e.running[name] = cancel
+			e.mu.Unlock()
+			go e.runActions(runCtx, "automation:"+name, actions)
 		}
 	})
 
@@ -113,7 +130,7 @@ func (e *Engine) runSunTriggers(ctx context.Context) {
 					continue
 				}
 				slog.Info("automation triggered (sun)", "name", a.Name, "event", a.Trigger.Event, "target", target.Format("15:04"))
-				go e.runActions(ctx, a.Action)
+				go e.runActions(ctx, "automation:"+a.Name, a.Action)
 			}
 		}
 	}
@@ -202,7 +219,7 @@ func (e *Engine) checkCondition(c *config.ConditionConfig) bool {
 	return true
 }
 
-func (e *Engine) runActions(ctx context.Context, actions []config.ActionConfig) {
+func (e *Engine) runActions(ctx context.Context, cause string, actions []config.ActionConfig) {
 	for _, action := range actions {
 		select {
 		case <-ctx.Done():
@@ -226,11 +243,22 @@ func (e *Engine) runActions(ctx context.Context, actions []config.ActionConfig) 
 			}
 		}
 
-		e.callService(action)
+		e.callService(cause, action)
 	}
 }
 
-func (e *Engine) callService(action config.ActionConfig) {
+func (e *Engine) callService(cause string, action config.ActionConfig) {
+	// Idempotent turn-off: if the target is already off, skip. Kills the redundant
+	// off-commands and on/off chatter/flicker from repeated motion-clear triggers
+	// (a bouncy sensor firing "clear" many times). turn_on always fires so a light
+	// reliably comes on when motion is detected; toggle/manual/Alexa paths don't
+	// route through here, so manual control is unaffected.
+	if action.Service == "switch.turn_off" && action.Entity != "" {
+		if ent, ok := e.store.Get(action.Entity); ok && ent.State == "off" {
+			slog.Debug("automation: skip turn_off (already off)", "entity", action.Entity)
+			return
+		}
+	}
 	slog.Info("automation: call service",
 		"service", action.Service,
 		"entity", action.Entity,
@@ -240,5 +268,6 @@ func (e *Engine) callService(action config.ActionConfig) {
 		"service": action.Service,
 		"entity":  action.Entity,
 		"data":    action.Data,
+		"cause":   cause,
 	})
 }

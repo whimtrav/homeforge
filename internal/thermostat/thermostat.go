@@ -410,6 +410,10 @@ func (m *Manager) checkAutoAway() {
 	if len(m.presenceSources()) == 0 {
 		return
 	}
+	// Refresh presence LIVE every tick: the cached presenceHome can go stale (seeded wrong at boot
+	// before the presence entity loaded, then never corrected because a steadily-"on" home_occupied
+	// fires no change event). Re-evaluating here clears away while the house is actually occupied.
+	m.setPresence(m.anyPresent())
 	after := time.Duration(orInt(m.cfg.AwayAfterMin, 15)) * time.Minute
 	m.mu.Lock()
 	trip := !m.presenceHome && !m.notHomeSince.IsZero() &&

@@ -47,6 +47,9 @@ type relayReq struct {
 	Channel string            `json:"channel,omitempty"`
 	Tag     string            `json:"tag,omitempty"`
 	Data    map[string]string `json:"data,omitempty"`
+	// DataOnly asks the relay to send a data-only FCM message so the app renders +
+	// BUNDLES notifications under one group (FCM notification messages can't group).
+	DataOnly bool `json:"data_only,omitempty"`
 }
 
 type relayResp struct {
@@ -146,7 +149,7 @@ func Send(relayURL string, p Payload) {
 	}
 	body, _ := json.Marshal(relayReq{
 		Tokens: toks, Title: p.Title, Message: p.Message, Image: p.Image,
-		Channel: p.Channel, Tag: p.Tag, Data: p.Data,
+		Channel: p.Channel, Tag: p.Tag, Data: p.Data, DataOnly: true,
 	})
 	req, err := http.NewRequest(http.MethodPost, relayURL, bytes.NewReader(body))
 	if err != nil {

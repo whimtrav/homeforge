@@ -12,6 +12,11 @@ services:
       - homeforge_data:/data
     environment:
       - TZ=America/Denver
+      # AI Terminal (complex-reasoning tier): HF's owner-gated /api/aiterm/ws proxies to the
+      # aiterm sidecar, and matrix "deluxe" scenes generate via its /gen — both opt-in (profile ai).
+      - AITERM_PROXY=ws://127.0.0.1:7799/ws
+      - MATRIX_GEN_URL=http://127.0.0.1:7799/gen
+      - AITERM_SECRET=${AITERM_SECRET}
 
   # Emporia Vue cloud bridge -> HomeForge MQTT (pyemvue sidecar). Creds in ./emporia/.env
   emporia:
@@ -221,6 +226,31 @@ services:
     depends_on:
       - homeforge
 
+  # AI Terminal sidecar (complex-reasoning tier): a glibc box with node + the AI CLIs
+  # (Claude Code / Codex / Gemini) and a PTY<->websocket bridge (aitermd). HF's owner-gated
+  # terminal proxies here, so the core image stays lean. The CLI runs on the USER'S OWN
+  # SUBSCRIPTION (no API key). Owner-gated in HF; opt-in via the "ai" profile.
+  aiterm:
+    image: homeforge-aiterm
+    build:
+      context: .
+      dockerfile: Dockerfile.aiterm
+    container_name: homeforge-aiterm
+    profiles: ["ai"]
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - homeforge
+    volumes:
+      - homeforge_data:/data:ro        # read HF's internal token
+      - homeforge_aiterm:/root         # persist the CLI login + config
+    environment:
+      - TZ=America/Denver
+      - AITERM_SECRET=${AITERM_SECRET}
+      - AITERM_ADDR=127.0.0.1:7799
+      # Optional: pin the CLI model (e.g. claude-opus-4-8); omit to let the CLI choose.
+      # - ANTHROPIC_MODEL=claude-opus-4-8
+
 volumes:
   homeforge_data:
   hubspace_data:
@@ -228,3 +258,4 @@ volumes:
   ollama_models:
   whisper_models:
   piper_models:
+  homeforge_aiterm:

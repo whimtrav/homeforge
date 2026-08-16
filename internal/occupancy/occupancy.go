@@ -5,7 +5,7 @@
 //   - switch.*_presence == "on"                          → mmwave presence (sustained)
 //   - motion binary_sensors / switch.*_motion == "on"    → motion (sustained while active)
 //   - number.*_button_c increments                       → a physical switch was pressed (a real
-//     finger, NOT an automated command)
+//                                                           finger, NOT an automated command)
 //
 // Occupied if any source is present now, OR there was motion / a physical press within the grace
 // window. Reads "empty" only once all phones are away AND no motion/press for grace_min minutes.
